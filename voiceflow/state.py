@@ -26,6 +26,8 @@ class AppState(enum.Enum):
     FORMATTING = "formatting"
     INJECTING = "injecting"
     LEARNING = "learning"
+    EDITING = "editing"
+    MEETING = "meeting"
     ERROR = "error"
 
     @property
@@ -38,18 +40,21 @@ class AppState(enum.Enum):
 # already moved on (a stale TRANSCRIBING->FORMATTING transition arriving
 # after the user already cancelled back to IDLE).
 _ALLOWED_TRANSITIONS: dict[AppState, set[AppState]] = {
-    AppState.IDLE: {AppState.RECORDING, AppState.ERROR},
+    AppState.IDLE: {AppState.RECORDING, AppState.MEETING, AppState.ERROR},
     AppState.RECORDING: {AppState.TRANSCRIBING, AppState.IDLE, AppState.ERROR},
     AppState.TRANSCRIBING: {
         AppState.FORMATTING,
         AppState.LEARNING,
+        AppState.EDITING,
         AppState.IDLE,
         AppState.ERROR,
     },
     AppState.FORMATTING: {AppState.INJECTING, AppState.IDLE, AppState.ERROR},
     AppState.LEARNING: {AppState.IDLE, AppState.ERROR},
+    AppState.EDITING: {AppState.INJECTING, AppState.IDLE, AppState.ERROR},
     AppState.INJECTING: {AppState.IDLE, AppState.ERROR},
-    AppState.ERROR: {AppState.IDLE, AppState.RECORDING},
+    AppState.MEETING: {AppState.IDLE, AppState.ERROR},
+    AppState.ERROR: {AppState.IDLE, AppState.RECORDING, AppState.MEETING},
 }
 
 StateListener = Callable[[AppState, AppState], None]

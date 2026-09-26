@@ -37,6 +37,29 @@ def test_learning_path():
     assert sm.transition(AppState.IDLE)
 
 
+def test_editing_path():
+    sm = StateManager()
+    assert sm.transition(AppState.RECORDING)
+    assert sm.transition(AppState.TRANSCRIBING)
+    assert sm.transition(AppState.EDITING)
+    assert sm.transition(AppState.INJECTING)
+    assert sm.transition(AppState.IDLE)
+
+
+def test_meeting_path():
+    sm = StateManager()
+    assert sm.transition(AppState.MEETING)
+    assert sm.transition(AppState.IDLE)
+
+
+def test_meeting_blocks_normal_recording():
+    sm = StateManager()
+    assert sm.transition(AppState.MEETING)
+    # Can't start a normal dictation while a meeting session is active.
+    assert sm.transition(AppState.RECORDING) is False
+    assert sm.state == AppState.MEETING
+
+
 def test_force_idle_always_succeeds_even_from_illegal_state():
     sm = StateManager()
     sm.transition(AppState.RECORDING)

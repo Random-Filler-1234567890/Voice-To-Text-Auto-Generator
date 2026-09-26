@@ -14,19 +14,56 @@ This codebase was written and unit-tested in a **Linux cloud sandbox**,
 not on a Mac. Every platform-independent module - configuration, the
 hotkey timing state machine, the personal-memory relevance ranking, prompt
 construction, the AI provider fallback chains, the clipboard-injection
-logic, and the full record-transcribe-format-inject pipeline orchestration
-- has a real, passing `pytest` suite (107 tests) that ran in that sandbox
-and is included in `tests/`. Run it yourself any time with `pytest`.
+logic, meeting-notes chunking, and the full pipeline orchestration - has a
+real, passing `pytest` suite (172 tests) that ran in that sandbox and is
+included in `tests/`. Run it yourself any time with `pytest`.
 
-What could **not** be built or tested here: the actual macOS `.app` bundle
-(building one requires macOS + Xcode command line tools), and anything
-that needs a real mic, a real global keyboard hook, real clipboard/paste
-simulation, or the native menu bar UI (`rumps`/PyObjC) - those only exist
-on macOS. So the very first time you build it, treat it like a normal
-piece of new software: build it, actually use it for a day, and tell me
-what needs fixing. It's engineered carefully and every piece of logic
-that *can* be verified has been - but "verified end-to-end on a real Mac"
-is a step only you can do the first time.
+What could **not** be built or tested here: the actual macOS `.app` bundle,
+and anything that needs a real mic, a real global keyboard hook, real
+clipboard/paste simulation, or the native menu bar UI/floating indicator
+(`rumps`/PyObjC) - those only exist on macOS. The first bug report you
+sent back (the onboarding alert reopening in a loop) was exactly this kind
+of thing: logic that looked right on paper but had never run against the
+real rumps event loop. It's fixed now (see **Changelog** below) and I've
+gone through the rest of the app looking for the same class of mistake,
+but "verified end-to-end on a real Mac" is still a step only you can fully
+do - especially the new floating listening indicator, which is flagged
+below as the single riskiest piece of UI code in the app.
+
+## Changelog
+
+**Since the first version you installed:**
+
+- **Fixed:** the "Welcome to VoiceFlow" popup that kept reopening and
+  blocked the app from being usable. Root cause: an internal timer meant
+  to fire once was actually a *repeating* timer, so the alert reappeared
+  every ~1 second forever. Onboarding now uses a genuinely one-shot timer
+  and a passive, non-blocking notification instead of a modal popup, so
+  this specific failure mode can't happen again even if a future change
+  reintroduces a timing bug.
+- **Added: Quick Setup.** Menu -> AI Providers -> Quick Setup opens Groq's
+  free key page in your browser, then prompts you to paste the key in, and
+  validates it live against Groq's API with a real pass/fail message - no
+  more silently saving a bad key. One key covers both transcription and
+  formatting; see **How the AI actually works** below.
+- **Added: floating listening indicator**, like Wispr Flow's - a small
+  pill appears near the bottom of your screen while VoiceFlow is
+  listening/thinking and disappears the instant it's done. Toggle it off
+  from the menu if it ever misbehaves.
+- **Added: Meeting Notes mode** - menu -> "Start Meeting Notes" for
+  continuous, hands-free transcription during a meeting or lecture. It
+  keeps recording in ~20s chunks in the background, cleans each one up
+  (filler words removed) and appends it with a timestamp to a running
+  Markdown file in `~/Documents/VoiceFlow Notes/`, then adds an AI-written
+  summary + action items when you stop.
+- **Added: "Edit:"/"Rewrite:" voice command.** Copy some text, say
+  "Edit: make this more formal" (or any instruction), and VoiceFlow
+  rewrites whatever's on your clipboard and pastes the result back.
+- **Added: Recent Dictations** menu (click any of your last 8 dictations
+  to copy it back to the clipboard) and a **usage stats** line (words
+  dictated, estimated time saved).
+- **Added:** `update_macos_app.sh` - one command to pull the latest code,
+  rebuild, and relaunch. See **Updating** below.
 
 ## What it does
 
@@ -53,11 +90,24 @@ is a step only you can do the first time.
 - **Clipboard-safe.** Your existing clipboard contents are snapshotted
   before pasting and restored automatically afterward - dictation never
   destroys something you had copied.
+- **Floating listening indicator.** A small pill near the bottom of the
+  screen shows when VoiceFlow is listening/transcribing/pasting, like
+  Wispr Flow's orb, then disappears. Toggleable from the menu.
+- **Meeting Notes mode.** One click starts continuous, hands-free
+  transcription for a whole meeting or lecture - no holding anything down.
+  Produces a running, cleaned-up Markdown transcript with an AI summary +
+  action items at the end.
+- **"Edit:"/"Rewrite:" voice command.** Copy any text, speak an
+  instruction, get it rewritten and pasted back - polish an email,
+  simplify a paragraph, change the tone, without touching the keyboard.
+- **Recent Dictations + usage stats.** Recall and recopy any of your last
+  8 dictations from the menu; see a running count of words dictated and
+  estimated time saved.
 - **Native menu bar app.** Status icon shows what it's doing (idle /
-  recording / transcribing / formatting / pasting / learning). Everything
-  - API keys, hotkey, mode, audio device, memory, logs - is reachable from
-  the menu. No config files to hand-edit (though you can, they're plain
-  JSON).
+  recording / transcribing / formatting / pasting / learning / editing /
+  in a meeting). Everything - API keys, hotkey, mode, audio device,
+  memory, history, logs - is reachable from the menu. No config files to
+  hand-edit (though you can, they're plain JSON).
 
 ## Quick start (macOS)
 
@@ -81,10 +131,33 @@ the app icon, and packages everything into `dist/VoiceFlow.app`. Then:
    Settings -> Privacy & Security), then quit and reopen VoiceFlow once.
    The menu's "Permissions & Setup Guide..." item walks you through this
    and jumps straight to each settings pane.
-4. Click the menu bar icon -> **AI Providers** -> **Set Groq API Key...**
-   (get a free key at console.groq.com - it's the fastest and has the
-   most generous free tier, which is why it's the default first provider).
+4. Click the menu bar icon -> **AI Providers** -> **Quick Setup...** - it
+   opens Groq's free key page in your browser, then asks you to paste the
+   key in, and confirms it works before you continue. Takes under a
+   minute; see **How the AI actually works** below for why this step can't
+   be skipped entirely.
 5. Hold **Right Option** anywhere and speak. Release to paste.
+
+## How the AI actually works
+
+VoiceFlow itself doesn't include a speech-to-text or language model - no
+personal app safely can, since that requires either a huge on-device model
+or a hosted backend with someone else's API key baked in (which anyone
+could extract from the app and abuse on your bill). So VoiceFlow calls a
+cloud AI provider directly, using **your own** API key, for two things:
+
+1. **Transcription** (audio -> raw text) - via Groq's or OpenAI's Whisper
+   API, or a fully offline local model if you enable it.
+2. **Formatting** (raw text -> clean, context-aware text) - via a fast
+   chat model (Groq/OpenAI/Anthropic).
+
+**You only need one key** - Groq's free tier covers both steps, which is
+why "Quick Setup" only asks for a Groq key. Adding OpenAI/Anthropic keys
+later is optional extra redundancy (automatic fallback if Groq is ever
+down), not a requirement. The key is stored only in
+`~/Library/Application Support/VoiceFlow/config.json` and is sent only to
+that provider's API, directly from your Mac - it never passes through any
+server of mine.
 
 If macOS refuses to open it ("cannot be opened because it is from an
 unidentified developer" - expected, since this is an unsigned personal
@@ -102,6 +175,23 @@ terminal instead of a silently-failed menu bar icon:
 
 Fix whatever the traceback shows (or send it to me), then re-run
 `build_macos_app.sh` to rebuild the `.app`.
+
+## Updating
+
+VoiceFlow doesn't auto-update (that needs a signed app + an update server,
+out of scope for a personal build) - but updating is one command:
+
+```bash
+cd VoiceFlow   # wherever you cloned it
+./update_macos_app.sh
+```
+
+This pulls the latest code, quits the running app, rebuilds it, replaces
+`/Applications/VoiceFlow.app`, and reopens it - so "update through GitHub"
+really just means running that one script whenever you're told there's a
+new version. Your config, memory, history, and stats all live outside the
+`.app` bundle (in `~/Library/Application Support/VoiceFlow/`), so updating
+never touches or resets any of that.
 
 ## How the hotkey works
 
@@ -122,6 +212,35 @@ fact instead of dictating text - e.g. "Learn: my boss is Sarah Chen and
 she leads the platform team." It's extracted into structured memory and
 automatically resurfaced whenever it's relevant to what you're saying.
 
+Start with **"Edit: "** or **"Rewrite: "** followed by an instruction to
+rewrite whatever's currently on your clipboard instead - e.g. copy a
+paragraph, say "Edit: make this more concise," and the rewritten version
+gets pasted back where your cursor is.
+
+For continuous transcription without holding anything (a meeting, a
+lecture, a long brainstorm), use **menu -> Start Meeting Notes** instead
+of the hotkey - see **Meeting Notes** below.
+
+## Meeting Notes
+
+Click the menu bar icon -> **Start Meeting Notes**. VoiceFlow records
+continuously in ~20-second chunks (configurable via `meeting.chunk_seconds`),
+transcribes and lightly cleans up each one (filler words removed, but
+nothing summarized away), and appends it with a timestamp to a Markdown
+file in `~/Documents/VoiceFlow Notes/Meeting YYYY-MM-DD HH-MM.md` as the
+meeting happens - so even if something crashes mid-meeting, everything up
+to that point is already safely on disk. Click **Stop Meeting Notes** when
+you're done; VoiceFlow adds an AI-written summary and action-items section
+to the top of the file and opens it for you.
+
+Known limitation: there's a brief (typically 1-3 second) gap between
+chunks while the previous one transcribes, since chunks are processed
+sequentially rather than while the next one records - a deliberate
+simplicity/robustness tradeoff over trying to record and transcribe
+concurrently. You'll never lose more than one API round-trip's worth of
+audio at a time, and it doesn't affect the normal hold-to-talk hotkey flow
+at all.
+
 ## Configuration
 
 Everything is also editable by hand at
@@ -139,8 +258,12 @@ Notable settings:
 | `hotkey.hold_threshold_ms` | How long a press must last before it counts as "hold" vs. a tap |
 | `hotkey.double_tap_window_ms` | Max gap between two taps to count as a double-tap |
 | `formatting.learn_prefixes` | Which spoken prefixes trigger the memory-teaching flow |
+| `formatting.edit_prefixes` | Which spoken prefixes trigger the clipboard rewrite flow |
 | `app_profiles_overrides` | Map a bundle id to a formatting category to override the built-in mapping |
 | `audio.save_recordings_for_debug` | Keep WAV files on disk for troubleshooting (off by default - audio never touches disk otherwise) |
+| `meeting.chunk_seconds` | How long each Meeting Notes recording chunk is (default 20s) |
+| `meeting.generate_summary` | Whether to add an AI summary/action-items section when a meeting ends |
+| `ui.show_hud` | Whether the floating listening indicator appears |
 
 ## Offline fallback
 
@@ -157,8 +280,11 @@ works fully offline (formatting/memory still need a cloud LLM key, though
 ```
 voiceflow/
   config.py            Thread-safe JSON config, dot-path access, self-healing on corruption
-  state.py              Thread-safe app state machine (IDLE/RECORDING/TRANSCRIBING/FORMATTING/INJECTING/LEARNING/ERROR)
-  pipeline.py            Orchestrates the full record -> transcribe -> (learn | format) -> inject flow
+  state.py              Thread-safe app state machine (IDLE/RECORDING/TRANSCRIBING/FORMATTING/INJECTING/LEARNING/EDITING/MEETING/ERROR)
+  pipeline.py            Orchestrates record -> transcribe -> (learn | edit | format) -> inject
+  meeting.py             Meeting Notes: chunked recording, cleanup, running Markdown file, summary
+  history.py              Rolling JSON history of recent dictations (recall/recopy from the menu)
+  stats.py                 Usage counters + estimated time-saved heuristic
   logging_setup.py       Rotating file + console logging, global exception hooks
   paths.py                Central filesystem paths (~/Library/Application Support/VoiceFlow)
   main.py / app.py       Entry point + the rumps menu bar application
@@ -179,19 +305,21 @@ voiceflow/
     relevance.py            Dependency-free TF-IDF cosine-similarity relevance ranking
 
   ai/
-    providers.py            Groq/OpenAI/Anthropic HTTP clients + local faster-whisper fallback
+    providers.py            Groq/OpenAI/Anthropic HTTP clients + local faster-whisper fallback + key validation
     transcription.py        Speech-to-text fallback chain
-    formatter.py             Formatting + "Learn:" fact-extraction fallback chain
+    formatter.py             Formatting, fact-extraction, rewrite, and meeting-summary fallback chain
     prompts.py                System prompt construction
 
   clipboard/
     injector.py              Copy -> paste -> timed restore, with full error handling
 
   ui/
+    hud.py                   Floating listening indicator (AppKit) - see Honest limitations below
     onboarding.py, permissions.py, sounds.py, launch_agent.py
                              Setup copy, System Settings deep links, sound feedback, launch-at-login
 
-tests/                    107 pytest tests covering every module above except the four macOS-only adapters
+tests/                    172 pytest tests covering every module above except the macOS-only adapters
+                          (hud.py, listener.py, macos_context.py, injector.py's real backends, app.py)
 ```
 
 ## Running the test suite
@@ -224,6 +352,16 @@ To set expectations correctly rather than over-promise:
   choice: it's built entirely on rumps' well-documented, stable API
   surface, versus hand-rolled AppKit `NSWindow` code that couldn't be
   tested here at all before reaching you.
+- **The floating listening indicator (`ui/hud.py`) is the one exception to
+  that rule** - it's real, hand-written AppKit window code (borderless
+  floating panel, custom layer/corner-radius, main-thread marshaling via
+  `PyObjCTools.AppHelper`), which is the kind of code most likely to behave
+  differently on a real display than expected. It's defensively written
+  (any failure disables it permanently rather than crashing the app) and
+  fully toggleable from the menu ("Show Listening Indicator") if it's ever
+  glitchy - dictation itself does not depend on it working.
+- Meeting Notes records in sequential chunks, not continuously overlapping
+  ones - see the known limitation noted in **Meeting Notes** above.
 - Distribution is unsigned (no Apple Developer Program membership was
   available to sign/notarize this from here), so the standard
   right-click-Open dance is needed once. Nothing else changes.

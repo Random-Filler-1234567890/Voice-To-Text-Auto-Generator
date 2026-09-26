@@ -50,12 +50,14 @@ class FakeTranscriptionService:
 
 
 class FakeFormattingService:
-    def __init__(self, formatted="Hello, world.", facts=None, exc=None):
+    def __init__(self, formatted="Hello, world.", facts=None, exc=None, rewritten="Rewritten text."):
         self.formatted = formatted
         self.facts = facts or []
         self.exc = exc
+        self.rewritten = rewritten
         self.format_calls = []
         self.extract_calls = []
+        self.rewrite_calls = []
 
     def format_transcript(self, raw_text, app_profile, memory_snippets):
         self.format_calls.append((raw_text, app_profile, memory_snippets))
@@ -68,6 +70,12 @@ class FakeFormattingService:
         if self.exc:
             raise self.exc
         return self.facts
+
+    def rewrite_text(self, instruction, target_text):
+        self.rewrite_calls.append((instruction, target_text))
+        if self.exc:
+            raise self.exc
+        return self.rewritten
 
 
 class FakeMemoryStore:
@@ -104,7 +112,44 @@ class FakeContextDetector:
         return ActiveWindowContext(app_name="Slack", bundle_id="com.tinyspeck.slackmacgap", window_title="")
 
 
-def make_pipeline(tmp_path, transcription=None, formatting=None, injector=None, audio=None):
+class FakeClipboardReader:
+    def __init__(self, text=""):
+        self.text = text
+
+    def paste(self):
+        return self.text
+
+
+class FakeHistory:
+    def __init__(self):
+        self.records = []
+
+    def record(self, text, app_name=""):
+        self.records.append((text, app_name))
+
+
+class FakeStats:
+    def __init__(self):
+        self.dictation_word_counts = []
+        self.facts_learned = 0
+
+    def record_dictation(self, word_count):
+        self.dictation_word_counts.append(word_count)
+
+    def record_fact_learned(self):
+        self.facts_learned += 1
+
+
+def make_pipeline(
+    tmp_path,
+    transcription=None,
+    formatting=None,
+    injector=None,
+    audio=None,
+    clipboard_reader=None,
+    history=None,
+    stats=None,
+):
     config = ConfigManager(path=tmp_path / "config.json")
     state = StateManager()
     notifications = []
@@ -120,6 +165,9 @@ def make_pipeline(tmp_path, transcription=None, formatting=None, injector=None, 
         context_detector=FakeContextDetector(),
         on_notify=lambda title, msg, level: notifications.append((title, msg, level)),
         on_result=lambda result: results.append(result),
+        clipboard_reader=clipboard_reader,
+        history=history,
+        stats=stats,
     )
     return pipeline, state, notifications, results
 
@@ -268,3 +316,137 @@ def test_cancel_resets_to_idle_and_cancels_audio(tmp_path):
     pipeline.cancel()
     assert audio.cancel_called is True
     assert state.state == AppState.IDLE
+
+
+def test_start_recording_ignored_during_meeting(tmp_path):
+    audio = FakeAudioRecorder()
+    pipeline, state, notifications, results = make_pipeline(tmp_path, audio=audio)
+    state.transition(AppState.MEETING)
+    pipeline.start_recording()
+    assert audio.started is False
+    assert state.state == AppState.MEETING
+
+
+# ---------------------------------------------------------------------- #
+# "Edit:"/"Rewrite:" voice command
+# ---------------------------------------------------------------------- #
+def test_edit_command_rewrites_clipboard_and_injects(tmp_path):
+    injector = FakeInjector()
+    clipboard_reader = FakeClipboardReader(text="hey whats up")
+    formatting = FakeFormattingService(rewritten="Hey, what's up?")
+    pipeline, state, notifications, results = make_pipeline(
+        tmp_path,
+        transcription=FakeTranscriptionService(text="Edit: make this more formal"),
+        formatting=formatting,
+        injector=injector,
+        clipboard_reader=clipboard_reader,
+    )
+    state.new_generation()
+    state.transition(AppState.RECORDING)
+    state.transition(AppState.TRANSCRIBING)
+    pipeline._process(FakeRecordingResult(), state.generation)
+
+    assert formatting.rewrite_calls == [("make this more formal", "hey whats up")]
+    assert injector.injected_text == "Hey, what's up?"
+    assert results[-1].kind == "edited"
+    assert state.state == AppState.IDLE
+
+
+def test_edit_command_with_empty_clipboard_is_rejected(tmp_path):
+    formatting = FakeFormattingService()
+    clipboard_reader = FakeClipboardReader(text="   ")
+    pipeline, state, notifications, results = make_pipeline(
+        tmp_path,
+        transcription=FakeTranscriptionService(text="Rewrite: make this formal"),
+        formatting=formatting,
+        clipboard_reader=clipboard_reader,
+    )
+    state.new_generation()
+    state.transition(AppState.RECORDING)
+    state.transition(AppState.TRANSCRIBING)
+    pipeline._process(FakeRecordingResult(), state.generation)
+
+    assert formatting.rewrite_calls == []
+    assert state.state == AppState.IDLE
+    assert any("clipboard" in msg.lower() for _, msg, _ in notifications)
+
+
+def test_edit_command_without_instruction_falls_back_to_dictation(tmp_path):
+    # "Edit:" with nothing after it isn't a usable instruction - treat the
+    # whole utterance as normal dictation instead of a no-op edit command.
+    injector = FakeInjector()
+    formatting = FakeFormattingService(formatted="Edit:")
+    pipeline, state, notifications, results = make_pipeline(
+        tmp_path,
+        transcription=FakeTranscriptionService(text="Edit:"),
+        formatting=formatting,
+        injector=injector,
+    )
+    state.new_generation()
+    state.transition(AppState.RECORDING)
+    state.transition(AppState.TRANSCRIBING)
+    pipeline._process(FakeRecordingResult(), state.generation)
+
+    assert formatting.rewrite_calls == []
+    assert results[-1].kind == "injected"
+
+
+def test_edit_command_injection_failure_falls_back_to_clipboard(tmp_path):
+    injector = FakeInjector(fail=True)
+    clipboard_reader = FakeClipboardReader(text="original text")
+    formatting = FakeFormattingService(rewritten="Rewritten.")
+    pipeline, state, notifications, results = make_pipeline(
+        tmp_path,
+        transcription=FakeTranscriptionService(text="Edit: fix this"),
+        formatting=formatting,
+        injector=injector,
+        clipboard_reader=clipboard_reader,
+    )
+    state.new_generation()
+    state.transition(AppState.RECORDING)
+    state.transition(AppState.TRANSCRIBING)
+    pipeline._process(FakeRecordingResult(), state.generation)
+
+    assert state.state == AppState.IDLE
+    assert results[-1].kind == "injection_failed"
+
+
+# ---------------------------------------------------------------------- #
+# History + stats recording
+# ---------------------------------------------------------------------- #
+def test_successful_dictation_records_history_and_stats(tmp_path):
+    injector = FakeInjector()
+    history = FakeHistory()
+    stats = FakeStats()
+    formatting = FakeFormattingService(formatted="Hello there friend")
+    pipeline, state, notifications, results = make_pipeline(
+        tmp_path, formatting=formatting, injector=injector, history=history, stats=stats
+    )
+    pipeline.start_recording()  # populates _captured_context via FakeContextDetector
+    state.transition(AppState.TRANSCRIBING)
+    pipeline._process(FakeRecordingResult(), state.generation)
+
+    assert history.records == [("Hello there friend", "Slack")]
+    assert stats.dictation_word_counts == [3]
+
+
+def test_learn_command_records_stats_per_fact(tmp_path):
+    stats = FakeStats()
+    formatting = FakeFormattingService(
+        facts=[
+            {"category": "person", "text": "Sarah is my boss"},
+            {"category": "vocabulary", "text": "ACME means a widget company"},
+        ]
+    )
+    pipeline, state, notifications, results = make_pipeline(
+        tmp_path,
+        transcription=FakeTranscriptionService(text="Learn: my boss is Sarah, ACME is a widget company"),
+        formatting=formatting,
+        stats=stats,
+    )
+    state.new_generation()
+    state.transition(AppState.RECORDING)
+    state.transition(AppState.TRANSCRIBING)
+    pipeline._process(FakeRecordingResult(), state.generation)
+
+    assert stats.facts_learned == 2

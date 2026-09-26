@@ -21,8 +21,10 @@ logger = logging.getLogger("voiceflow.ai.providers")
 
 GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 
 _RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -314,3 +316,57 @@ class AnthropicChatProvider(FormattingProvider):
             return retry_with_backoff(_do_request, max_retries=self._max_retries)
         except RetryableError as exc:
             raise ProviderError("anthropic", str(exc)) from exc
+
+
+def validate_api_key(provider: str, api_key: str, timeout: float = 10.0) -> tuple[bool, str]:
+    """Make one cheap, real API call to confirm a key actually works.
+
+    Used by the Quick Setup flow so the user gets immediate "yes this works"
+    or "no, here's why" feedback instead of silently saving a typo'd or
+    expired key and only discovering it's broken the next time they dictate.
+    """
+    if not api_key or not api_key.strip():
+        return False, "No key entered."
+
+    try:
+        if provider == "groq":
+            response = requests.get(
+                GROQ_MODELS_URL, headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout
+            )
+        elif provider == "openai":
+            response = requests.get(
+                OPENAI_MODELS_URL, headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout
+            )
+        elif provider == "anthropic":
+            response = requests.post(
+                ANTHROPIC_MESSAGES_URL,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                timeout=timeout,
+            )
+        else:
+            return False, f"Unknown provider: {provider}"
+    except requests.Timeout:
+        return False, "Validation timed out - check your internet connection and try again."
+    except requests.ConnectionError:
+        return False, "Couldn't reach the API - check your internet connection and try again."
+    except requests.RequestException as exc:
+        return False, f"Network error: {exc}"
+
+    if response.status_code == 200:
+        return True, "Key verified!"
+    if response.status_code == 401:
+        return False, "That key was rejected (invalid or revoked)."
+    if response.status_code == 429:
+        # The key IS valid - it's just rate-limited/out of quota, which is a
+        # perfectly usable state (transient), so treat this as a pass.
+        return True, "Key verified (currently rate-limited, but valid)."
+    return False, f"Unexpected response from {provider} (HTTP {response.status_code})."

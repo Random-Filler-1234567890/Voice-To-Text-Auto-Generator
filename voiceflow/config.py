@@ -65,6 +65,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "remove_filler_words": True,
         "auto_punctuate": True,
         "learn_prefixes": ["learn:", "remember:"],
+        "edit_prefixes": ["edit:", "rewrite:"],
         "preserve_tone": True,
     },
     "clipboard": {
@@ -74,11 +75,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_snippets_injected": 8,
         "max_entries": 2000,
     },
+    "history": {
+        "max_entries": 50,
+    },
+    "meeting": {
+        "chunk_seconds": 20,
+        "generate_summary": True,
+        "min_chunk_seconds_to_transcribe": 1.5,
+    },
     "ui": {
         "show_dock_icon": True,
         "launch_at_login": False,
         "sound_feedback": True,
         "menu_bar_icon_style": "waveform",
+        "show_hud": True,
+        "onboarding_shown": False,
     },
     "app_profiles_overrides": {},
 }

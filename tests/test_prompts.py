@@ -3,13 +3,18 @@ import json
 import pytest
 
 from voiceflow.ai.prompts import (
+    MEETING_SEGMENT_SYSTEM_PROMPT,
+    MEETING_SUMMARY_SYSTEM_PROMPT,
     build_formatting_system_prompt,
+    build_rewrite_system_prompt,
     parse_json_object,
     strip_learn_prefix,
+    strip_prefix,
 )
 from voiceflow.context.app_profiles import get_profile
 
 LEARN_PREFIXES = ["learn:", "remember:"]
+EDIT_PREFIXES = ["edit:", "rewrite:"]
 
 
 @pytest.mark.parametrize(
@@ -76,3 +81,44 @@ def test_formatting_prompt_omits_memory_section_when_empty():
     profile = get_profile(None, None, None)
     prompt = build_formatting_system_prompt(profile, memory_snippets=[])
     assert "taught you the following facts" not in prompt
+
+
+@pytest.mark.parametrize(
+    "transcript,expected_remainder",
+    [
+        ("Edit: make this more formal", "make this more formal"),
+        ("edit: make this more formal", "make this more formal"),
+        ("Rewrite: shorten this", "shorten this"),
+        ("Edit make this more formal", "make this more formal"),
+    ],
+)
+def test_strip_prefix_detects_edit_commands(transcript, expected_remainder):
+    is_edit, remainder = strip_prefix(transcript, EDIT_PREFIXES)
+    assert is_edit is True
+    assert remainder == expected_remainder
+
+
+def test_strip_prefix_ignores_unrelated_text():
+    is_edit, remainder = strip_prefix("please send this email", EDIT_PREFIXES)
+    assert is_edit is False
+    assert remainder == "please send this email"
+
+
+def test_strip_prefix_bare_prefix_with_no_instruction():
+    is_edit, remainder = strip_prefix("Edit:", EDIT_PREFIXES)
+    assert is_edit is True
+    assert remainder == ""
+
+
+def test_build_rewrite_system_prompt_includes_instruction():
+    prompt = build_rewrite_system_prompt("make this more formal")
+    assert "make this more formal" in prompt
+    assert "output" in prompt.lower()
+
+
+def test_meeting_prompts_are_nonempty_and_distinct():
+    assert MEETING_SEGMENT_SYSTEM_PROMPT.strip()
+    assert MEETING_SUMMARY_SYSTEM_PROMPT.strip()
+    assert MEETING_SEGMENT_SYSTEM_PROMPT != MEETING_SUMMARY_SYSTEM_PROMPT
+    assert "not a summary" in MEETING_SEGMENT_SYSTEM_PROMPT.lower()
+    assert "Action Items" in MEETING_SUMMARY_SYSTEM_PROMPT

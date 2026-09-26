@@ -99,16 +99,17 @@ def build_fact_extraction_user_message(raw_learn_statement: str) -> str:
     return raw_learn_statement.strip()
 
 
-def strip_learn_prefix(transcript: str, learn_prefixes: list[str]) -> tuple[bool, str]:
-    """Return ``(is_learn_command, remainder)``.
+def strip_prefix(transcript: str, prefixes: list[str]) -> tuple[bool, str]:
+    """Return ``(matched, remainder)`` if the transcript opens with one of ``prefixes``.
 
     Matching is case-insensitive and tolerant of the leading prefix being
     immediately followed by whitespace or a colon-space, since Whisper's
-    punctuation around the spoken prefix is unpredictable.
+    punctuation around the spoken prefix is unpredictable (it might render
+    "Learn:" as "learn:", "Learn ", or even drop the colon entirely).
     """
     stripped = transcript.strip()
     lower = stripped.lower()
-    for prefix in learn_prefixes:
+    for prefix in prefixes:
         prefix_norm = prefix.rstrip(":").strip().lower()
         for candidate in (f"{prefix_norm}:", f"{prefix_norm} "):
             if lower.startswith(candidate):
@@ -116,6 +117,60 @@ def strip_learn_prefix(transcript: str, learn_prefixes: list[str]) -> tuple[bool
         if lower == prefix_norm:
             return True, ""
     return False, stripped
+
+
+def strip_learn_prefix(transcript: str, learn_prefixes: list[str]) -> tuple[bool, str]:
+    """Return ``(is_learn_command, remainder)``. See :func:`strip_prefix`."""
+    return strip_prefix(transcript, learn_prefixes)
+
+
+def build_rewrite_system_prompt(instruction: str) -> str:
+    """System prompt for the 'Edit:'/'Rewrite:' voice command.
+
+    The user speaks an instruction (e.g. "make this more formal") while
+    some text they want edited is sitting on their clipboard. The model
+    receives the clipboard text as the user message and must return only
+    the rewritten result.
+    """
+    return (
+        "You are VoiceFlow's rewrite engine. The user has copied a piece of text "
+        "to their clipboard and spoken an instruction for how to change it. You "
+        "will receive that clipboard text as the message. Apply the instruction "
+        "below to it and output ONLY the rewritten text - no commentary, no "
+        "preamble, no quotation marks, no explanation of what you changed.\n\n"
+        f'Instruction: "{instruction.strip()}"\n\n'
+        "If the instruction is ambiguous, make the most reasonable interpretation "
+        "rather than asking for clarification (you cannot ask - this is a "
+        "one-shot batch rewrite). Preserve the original formatting (line breaks, "
+        "lists, code blocks) unless the instruction asks you to change it."
+    )
+
+
+MEETING_SEGMENT_SYSTEM_PROMPT = """You are VoiceFlow's meeting-notes cleanup engine. You \
+receive one raw, unpunctuated speech-to-text segment from an ongoing meeting or lecture \
+recording. Clean it up for note-taking: remove filler words ("um", "uh", "like"), false \
+starts, and self-corrections; add punctuation and capitalization; but do NOT summarize, \
+shorten, paraphrase away specifics, or omit any content - this is a verbatim cleanup \
+pass, not a summary. Output ONLY the cleaned segment text, nothing else. If the segment \
+is empty, silence, or contains no discernible speech, output nothing at all.
+"""
+
+MEETING_SUMMARY_SYSTEM_PROMPT = """You are VoiceFlow's meeting-summary engine. You receive \
+a full cleaned transcript of a meeting or lecture. Produce a concise Markdown summary with \
+these sections, in this order:
+
+## Summary
+A short paragraph (2-4 sentences) capturing what the meeting/lecture was about.
+
+## Key Points
+A bullet list of the most important points, decisions, or facts discussed.
+
+## Action Items
+A bullet list of concrete follow-up actions or tasks mentioned (write "None mentioned" if \
+there aren't any - do not invent action items that weren't discussed).
+
+Output ONLY this Markdown, nothing before or after it.
+"""
 
 
 def parse_json_object(text: str) -> dict:

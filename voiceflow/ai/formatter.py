@@ -7,8 +7,11 @@ import logging
 from voiceflow.ai.errors import AllProvidersFailedError, NoProviderConfiguredError
 from voiceflow.ai.prompts import (
     FACT_EXTRACTION_SYSTEM_PROMPT,
+    MEETING_SEGMENT_SYSTEM_PROMPT,
+    MEETING_SUMMARY_SYSTEM_PROMPT,
     build_fact_extraction_user_message,
     build_formatting_system_prompt,
+    build_rewrite_system_prompt,
     parse_json_object,
 )
 from voiceflow.ai.providers import (
@@ -121,3 +124,23 @@ class FormattingService:
         except Exception:
             logger.exception("Failed to parse fact extraction response: %r", raw_response)
             return []
+
+    def custom_completion(self, system_prompt: str, user_message: str) -> str:
+        """Escape hatch for one-off LLM calls (meeting summaries, rewrites, etc.)
+        that don't fit the dictation-formatting or fact-extraction shapes above,
+        while still going through the same provider fallback chain."""
+        return self._run_chain(system_prompt, user_message)
+
+    def rewrite_text(self, instruction: str, target_text: str) -> str:
+        """The 'Edit:'/'Rewrite:' voice command: apply a spoken instruction to
+        whatever text is currently on the clipboard."""
+        system_prompt = build_rewrite_system_prompt(instruction)
+        return self._run_chain(system_prompt, target_text)
+
+    def clean_meeting_segment(self, raw_segment_text: str) -> str:
+        """Light filler-word/punctuation cleanup for one meeting-notes audio chunk."""
+        return self._run_chain(MEETING_SEGMENT_SYSTEM_PROMPT, raw_segment_text)
+
+    def summarize_meeting(self, full_transcript: str) -> str:
+        """Produce a Markdown summary/action-items block for a finished meeting."""
+        return self._run_chain(MEETING_SUMMARY_SYSTEM_PROMPT, full_transcript)

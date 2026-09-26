@@ -8,7 +8,10 @@ This module is macOS-only (it imports ``rumps``). Run it with
 from __future__ import annotations
 
 import logging
+import subprocess
 import sys
+import threading
+import webbrowser
 
 try:
     import rumps
@@ -22,21 +25,28 @@ except ImportError:
 
 from voiceflow import __version__
 from voiceflow.ai.formatter import FormattingService
+from voiceflow.ai.providers import validate_api_key
 from voiceflow.ai.transcription import TranscriptionService
 from voiceflow.audio.recorder import AudioRecorder
-from voiceflow.clipboard.injector import ClipboardInjector
+from voiceflow.clipboard.injector import ClipboardInjector, PyperclipBackend
 from voiceflow.config import ConfigManager
 from voiceflow.context.macos_context import ActiveAppDetector
+from voiceflow.history import DictationHistory
 from voiceflow.hotkeys.listener import DEFAULT_KEY, SUPPORTED_KEYS, GlobalHotkeyListener
 from voiceflow.hotkeys.state_machine import HotkeyEvent, HotkeyMode
 from voiceflow.logging_setup import configure_logging
+from voiceflow.meeting import MeetingNotesSession
 from voiceflow.memory.store import MemoryStore
-from voiceflow.paths import LOG_PATH, MEMORY_PATH
+from voiceflow.paths import LOG_PATH, MEETING_NOTES_DIR, MEMORY_PATH
 from voiceflow.pipeline import DictationPipeline, NotifyLevel, PipelineResult
 from voiceflow.state import AppState, StateManager
+from voiceflow.stats import UsageStats
 from voiceflow.ui import launch_agent, onboarding, permissions, sounds
+from voiceflow.ui.hud import ListeningHUD
 
 logger = logging.getLogger("voiceflow.app")
+
+GROQ_SIGNUP_URL = "https://console.groq.com/keys"
 
 _STATE_TITLES = {
     AppState.IDLE: "🎙",
@@ -45,7 +55,18 @@ _STATE_TITLES = {
     AppState.FORMATTING: "✍️",
     AppState.INJECTING: "📋",
     AppState.LEARNING: "🧠",
+    AppState.EDITING: "🪄",
+    AppState.MEETING: "🗒️",
     AppState.ERROR: "⚠️",
+}
+
+_HUD_TEXT = {
+    AppState.RECORDING: "🎙  Listening...",
+    AppState.TRANSCRIBING: "⏳  Transcribing...",
+    AppState.FORMATTING: "✍️  Formatting...",
+    AppState.INJECTING: "📋  Pasting...",
+    AppState.LEARNING: "🧠  Learning...",
+    AppState.EDITING: "🪄  Rewriting...",
 }
 
 _MODE_LABELS = {
@@ -53,6 +74,9 @@ _MODE_LABELS = {
     HotkeyMode.HOLD: "Hold-to-talk only",
     HotkeyMode.TOGGLE: "Toggle (tap to start/stop)",
 }
+
+_HISTORY_MENU_SLOTS = 8
+_HISTORY_PREVIEW_LEN = 46
 
 
 class VoiceFlowApp(rumps.App):
@@ -62,9 +86,12 @@ class VoiceFlowApp(rumps.App):
         self.config = ConfigManager()
         self.state = StateManager()
         self.memory = MemoryStore(max_entries=self.config.get("memory.max_entries", 2000))
+        self.history = DictationHistory(max_entries=self.config.get("history.max_entries", 50))
+        self.stats = UsageStats()
         self.context_detector = ActiveAppDetector()
         self.transcription_service = TranscriptionService(self.config)
         self.formatting_service = FormattingService(self.config)
+        self.hud = ListeningHUD()
 
         self.audio_recorder = AudioRecorder(
             sample_rate=self.config.get("audio.sample_rate", 16000),
@@ -87,16 +114,22 @@ class VoiceFlowApp(rumps.App):
             context_detector=self.context_detector,
             on_notify=self._notify,
             on_result=self._on_pipeline_result,
+            history=self.history,
+            stats=self.stats,
         )
+
+        self.meeting_session: MeetingNotesSession | None = None
+        self._meeting_timer: rumps.Timer | None = None
 
         self.state.add_listener(self._on_state_change)
 
         self.hotkey_listener: GlobalHotkeyListener | None = None
         self._build_menu()
         self._start_hotkey_listener()
+        self._refresh_history_menu()
+        self._refresh_stats_item()
 
-        if not self.config.has_any_provider_configured():
-            rumps.Timer(lambda _t: self._first_run_prompt(), 1.0).start()
+        self._schedule_first_run_check()
 
     # ------------------------------------------------------------------ #
     # Menu construction
@@ -104,11 +137,22 @@ class VoiceFlowApp(rumps.App):
     def _build_menu(self) -> None:
         self.status_item = rumps.MenuItem("Status: Idle")
         self.toggle_item = rumps.MenuItem("Start Dictation", callback=self._on_toggle_clicked)
+        self.meeting_item = rumps.MenuItem(
+            "Start Meeting Notes", callback=self._on_toggle_meeting_notes
+        )
 
         hotkey_menu = self._build_hotkey_menu()
         providers_menu = self._build_providers_menu()
         memory_menu = self._build_memory_menu()
+        history_menu = self._build_history_menu()
         audio_menu = self._build_audio_menu()
+
+        self.stats_item = rumps.MenuItem(self.stats.summary_line())
+
+        self.show_hud_item = rumps.MenuItem(
+            "Show Listening Indicator", callback=self._on_toggle_hud
+        )
+        self.show_hud_item.state = self.config.get("ui.show_hud", True)
 
         self.launch_at_login_item = rumps.MenuItem(
             "Launch at Login", callback=self._on_toggle_launch_at_login
@@ -124,16 +168,21 @@ class VoiceFlowApp(rumps.App):
             self.status_item,
             None,
             self.toggle_item,
+            self.meeting_item,
             None,
             hotkey_menu,
             providers_menu,
             memory_menu,
+            history_menu,
             audio_menu,
             None,
             rumps.MenuItem("Permissions & Setup Guide...", callback=self._on_show_setup_guide),
-            rumps.MenuItem("How Hotkeys Work...", callback=self._on_show_hotkey_help),
+            rumps.MenuItem("How VoiceFlow Works...", callback=self._on_show_hotkey_help),
             rumps.MenuItem("View Logs", callback=self._on_view_logs),
             None,
+            self.stats_item,
+            None,
+            self.show_hud_item,
             self.sound_feedback_item,
             self.launch_at_login_item,
             None,
@@ -168,6 +217,8 @@ class VoiceFlowApp(rumps.App):
 
     def _build_providers_menu(self) -> "rumps.MenuItem":
         menu = rumps.MenuItem("AI Providers")
+        menu.add(rumps.MenuItem("Quick Setup...", callback=self._on_quick_setup))
+        menu.add(None)
         menu.add(rumps.MenuItem("Set Groq API Key...", callback=self._make_key_setter("groq")))
         menu.add(rumps.MenuItem("Set OpenAI API Key...", callback=self._make_key_setter("openai")))
         menu.add(
@@ -191,6 +242,24 @@ class VoiceFlowApp(rumps.App):
         menu.add(None)
         menu.add(rumps.MenuItem("Open Memory File", callback=self._on_open_memory_file))
         menu.add(rumps.MenuItem("Clear All Memory...", callback=self._on_clear_memory))
+        return menu
+
+    def _build_history_menu(self) -> "rumps.MenuItem":
+        menu = rumps.MenuItem("Recent Dictations")
+        self._history_items: list[rumps.MenuItem] = []
+        for i in range(_HISTORY_MENU_SLOTS):
+            # Each placeholder gets a distinct title at insertion time -
+            # rumps.MenuItem tracks children by title internally, so two
+            # items sharing the same title when added could collide.
+            # Updating .title later (in _refresh_history_menu) on an
+            # already-added item is a plain attribute mutation and doesn't
+            # re-trigger that insertion-time bookkeeping, so it's safe even
+            # if two entries end up with identical preview text.
+            item = rumps.MenuItem(f"{i + 1}. (empty)", callback=None)
+            self._history_items.append(item)
+            menu.add(item)
+        menu.add(None)
+        menu.add(rumps.MenuItem("Clear History", callback=self._on_clear_history))
         return menu
 
     def _build_audio_menu(self) -> "rumps.MenuItem":
@@ -271,23 +340,38 @@ class VoiceFlowApp(rumps.App):
             self.pipeline.stop_recording()
 
     # ------------------------------------------------------------------ #
-    # Pipeline callbacks
+    # Pipeline / state callbacks
     # ------------------------------------------------------------------ #
     def _on_state_change(self, old_state: AppState, new_state: AppState) -> None:
         self.title = _STATE_TITLES.get(new_state, "🎙")
         self.status_item.title = f"Status: {new_state.value.capitalize()}"
-        self.toggle_item.title = "Stop Dictation" if new_state == AppState.RECORDING else (
-            "Start Dictation" if new_state == AppState.IDLE else "Working..."
-        )
-        self.toggle_item.set_callback(
-            self._on_toggle_clicked if new_state in (AppState.IDLE, AppState.RECORDING) else None
-        )
+
+        if new_state == AppState.MEETING:
+            self.toggle_item.title = "Dictation unavailable (meeting in progress)"
+            self.toggle_item.set_callback(None)
+        else:
+            self.toggle_item.title = (
+                "Stop Dictation" if new_state == AppState.RECORDING else
+                "Start Dictation" if new_state == AppState.IDLE else "Working..."
+            )
+            self.toggle_item.set_callback(
+                self._on_toggle_clicked if new_state in (AppState.IDLE, AppState.RECORDING) else None
+            )
+
+        if self.config.get("ui.show_hud", True):
+            if new_state in _HUD_TEXT:
+                self.hud.show(_HUD_TEXT[new_state])
+            elif new_state in (AppState.IDLE, AppState.ERROR):
+                self.hud.hide()
 
     def _on_pipeline_result(self, result: PipelineResult) -> None:
         if result.kind == "learned":
             self.memory_count_item.title = f"{self.memory.count()} facts learned"
             if self.config.get("ui.sound_feedback", True):
                 sounds.play_learned()
+        elif result.kind in ("injected", "edited"):
+            self._refresh_history_menu()
+            self._refresh_stats_item()
 
     def _notify(self, title: str, message: str, level: str) -> None:
         try:
@@ -297,8 +381,40 @@ class VoiceFlowApp(rumps.App):
         if level == NotifyLevel.ERROR and self.config.get("ui.sound_feedback", True):
             sounds.play_error()
 
+    def _refresh_stats_item(self) -> None:
+        self.stats_item.title = self.stats.summary_line()
+
+    def _refresh_history_menu(self) -> None:
+        entries = self.history.recent(_HISTORY_MENU_SLOTS)
+        for i, item in enumerate(self._history_items):
+            if i < len(entries):
+                entry = entries[i]
+                preview = entry.text.replace("\n", " ").strip()
+                if len(preview) > _HISTORY_PREVIEW_LEN:
+                    preview = preview[:_HISTORY_PREVIEW_LEN].rstrip() + "..."
+                suffix = f"  ({entry.app_name})" if entry.app_name else ""
+                item.title = f"{i + 1}. {preview}{suffix}"
+                item.set_callback(self._make_history_copy_handler(entry.text))
+            else:
+                item.title = f"{i + 1}. (empty)"
+                item.set_callback(None)
+
+    def _make_history_copy_handler(self, text: str):
+        def _handler(_sender):
+            try:
+                PyperclipBackend().copy(text)
+                self._notify("VoiceFlow", "Copied to clipboard.", NotifyLevel.INFO)
+            except Exception:
+                logger.exception("Failed to copy history entry to clipboard")
+
+        return _handler
+
+    def _on_clear_history(self, _sender) -> None:
+        self.history.clear()
+        self._refresh_history_menu()
+
     # ------------------------------------------------------------------ #
-    # Menu callbacks
+    # Menu callbacks - dictation
     # ------------------------------------------------------------------ #
     def _on_toggle_clicked(self, _sender) -> None:
         if self.state.state == AppState.IDLE:
@@ -306,6 +422,125 @@ class VoiceFlowApp(rumps.App):
         elif self.state.state == AppState.RECORDING:
             self.pipeline.stop_recording()
 
+    # ------------------------------------------------------------------ #
+    # Menu callbacks - Meeting Notes
+    # ------------------------------------------------------------------ #
+    def _on_toggle_meeting_notes(self, _sender) -> None:
+        if self.state.state == AppState.MEETING:
+            self._stop_meeting_notes()
+        elif self.state.state == AppState.IDLE:
+            self._start_meeting_notes()
+        else:
+            self._notify(
+                "VoiceFlow",
+                "Finish the current dictation before starting Meeting Notes.",
+                NotifyLevel.INFO,
+            )
+
+    def _start_meeting_notes(self) -> None:
+        if not self.state.transition(AppState.MEETING):
+            return
+
+        def _recorder_factory():
+            return AudioRecorder(
+                sample_rate=self.config.get("audio.sample_rate", 16000),
+                channels=self.config.get("audio.channels", 1),
+                device=self.config.get("audio.device", None),
+                max_recording_seconds=self.config.get("meeting.chunk_seconds", 20) + 5,
+            )
+
+        self.meeting_session = MeetingNotesSession(
+            audio_recorder_factory=_recorder_factory,
+            transcription_service=self.transcription_service,
+            formatting_service=self.formatting_service,
+            chunk_seconds=self.config.get("meeting.chunk_seconds", 20),
+            min_chunk_seconds_to_transcribe=self.config.get(
+                "meeting.min_chunk_seconds_to_transcribe", 1.5
+            ),
+            generate_summary=self.config.get("meeting.generate_summary", True),
+            notes_dir=MEETING_NOTES_DIR,
+            on_notify=self._notify,
+        )
+        try:
+            file_path = self.meeting_session.start()
+        except Exception:
+            logger.exception("Failed to start meeting notes session")
+            self._notify("VoiceFlow", "Couldn't start Meeting Notes.", NotifyLevel.ERROR)
+            self.meeting_session = None
+            self.state.force_idle()
+            return
+
+        self.meeting_item.title = "Stop Meeting Notes"
+        self._notify(
+            "Meeting Notes started",
+            f"Recording continuously. Notes are being saved to {file_path.name}.",
+            NotifyLevel.INFO,
+        )
+        self._meeting_timer = rumps.Timer(self._on_meeting_tick, 1.0)
+        self._meeting_timer.start()
+
+    def _stop_meeting_notes(self) -> None:
+        if self._meeting_timer is not None:
+            self._meeting_timer.stop()
+            self._meeting_timer = None
+
+        # Grab and immediately clear the session reference (synchronously,
+        # on the main thread) before anything async happens. This is what
+        # makes a rapid double-click on "Stop Meeting Notes" safe: the
+        # state transition to IDLE only completes later on the background
+        # _finish() thread, so without this, a second click landing before
+        # that finishes would see state==MEETING and self.meeting_session
+        # still set, and spawn a second concurrent _finish() thread against
+        # the same session (duplicate summary generation, wasted API call).
+        session = self.meeting_session
+        self.meeting_session = None
+        self.meeting_item.title = "Start Meeting Notes"
+        self.hud.hide()
+
+        if session is None:
+            self.state.force_idle()
+            return
+
+        def _finish():
+            try:
+                file_path = session.stop()
+            except Exception:
+                logger.exception("Failed to stop meeting notes session cleanly")
+                file_path = session.file_path
+            self.stats.record_meeting(session.word_count)
+            self._refresh_stats_item()
+            self.state.transition(AppState.IDLE)
+            if file_path is not None:
+                self._notify(
+                    "Meeting Notes saved",
+                    f"{session.word_count} words captured -> {file_path.name}",
+                    NotifyLevel.INFO,
+                )
+                try:
+                    subprocess.run(["open", str(file_path)], check=False)
+                except Exception:
+                    logger.exception("Failed to open finished meeting notes file")
+
+        threading.Thread(target=_finish, daemon=True, name="voiceflow-meeting-stop").start()
+
+    def _on_meeting_tick(self, _sender) -> None:
+        if self.meeting_session is None:
+            return
+        if not self.meeting_session.is_active:
+            # The background loop exited on its own (e.g. a mic error) -
+            # tidy up the menu/HUD/state rather than ticking on a dead session.
+            self._stop_meeting_notes()
+            return
+        elapsed = int(self.meeting_session.elapsed_seconds())
+        minutes, seconds = divmod(elapsed, 60)
+        if self.config.get("ui.show_hud", True):
+            self.hud.update_text(f"🗒️  Meeting Notes — {minutes:02d}:{seconds:02d}")
+        else:
+            self.hud.hide()
+
+    # ------------------------------------------------------------------ #
+    # Menu callbacks - hotkey / providers / memory / audio settings
+    # ------------------------------------------------------------------ #
     def _make_key_selector(self, key_name: str):
         def _handler(_sender):
             for item in self._key_items.values():
@@ -326,30 +561,51 @@ class VoiceFlowApp(rumps.App):
 
         return _handler
 
+    def _on_quick_setup(self, _sender) -> None:
+        rumps.alert(
+            title="VoiceFlow Quick Setup",
+            message=onboarding.NO_PROVIDER_MESSAGE,
+            ok="Continue",
+        )
+        try:
+            webbrowser.open(GROQ_SIGNUP_URL)
+        except Exception:
+            logger.exception("Failed to open browser for Groq signup")
+        self._prompt_and_save_key("groq")
+
     def _make_key_setter(self, provider: str):
         def _handler(_sender):
-            current = self.config.get(f"providers.{provider}_api_key", "")
-            masked = ("•" * min(len(current), 20)) if current else ""
-            window = rumps.Window(
-                message=f"Enter your {provider.capitalize()} API key. It's stored locally "
-                f"in ~/Library/Application Support/VoiceFlow/config.json and never leaves "
-                f"your machine except to call {provider.capitalize()}'s API directly.",
-                title=f"{provider.capitalize()} API Key",
-                default_text=masked,
-                ok="Save",
-                cancel="Cancel",
-                dimensions=(320, 22),
-            )
-            try:
-                window.icon = None
-            except Exception:
-                pass
-            response = window.run()
-            if response.clicked and response.text and response.text != masked:
-                self.config.set(f"providers.{provider}_api_key", response.text.strip())
-                self._notify("VoiceFlow", f"{provider.capitalize()} API key saved.", NotifyLevel.INFO)
+            self._prompt_and_save_key(provider)
 
         return _handler
+
+    def _prompt_and_save_key(self, provider: str) -> None:
+        current = self.config.get(f"providers.{provider}_api_key", "")
+        masked = ("•" * min(len(current), 20)) if current else ""
+        window = rumps.Window(
+            message=f"Paste your {provider.capitalize()} API key below. It's stored locally "
+            f"in ~/Library/Application Support/VoiceFlow/config.json and never leaves "
+            f"your machine except to call {provider.capitalize()}'s API directly.",
+            title=f"{provider.capitalize()} API Key",
+            default_text=masked,
+            ok="Save",
+            cancel="Cancel",
+            dimensions=(320, 22),
+        )
+        response = window.run()
+        if not (response.clicked and response.text and response.text.strip() != masked):
+            return
+
+        key = response.text.strip()
+        self.config.set(f"providers.{provider}_api_key", key)
+        self._notify("VoiceFlow", f"{provider.capitalize()} key saved - verifying...", NotifyLevel.INFO)
+
+        def _validate():
+            ok, message = validate_api_key(provider, key)
+            level = NotifyLevel.INFO if ok else NotifyLevel.ERROR
+            self._notify(f"{provider.capitalize()} API Key", message, level)
+
+        threading.Thread(target=_validate, daemon=True, name="voiceflow-key-validate").start()
 
     def _on_toggle_local_fallback(self, sender) -> None:
         order = self.config.get("providers.transcription_order", [])
@@ -383,6 +639,8 @@ class VoiceFlowApp(rumps.App):
                 logger.exception("Manual fact extraction failed")
                 self._notify("VoiceFlow", f"Couldn't process that: {exc}", NotifyLevel.ERROR)
                 return
+            for _ in added:
+                self.stats.record_fact_learned()
             self._on_pipeline_result(PipelineResult(kind="learned", learned_count=len(added)))
             if added:
                 self._notify(
@@ -393,13 +651,9 @@ class VoiceFlowApp(rumps.App):
             else:
                 self._notify("VoiceFlow", "Didn't find a clear fact in that.", NotifyLevel.INFO)
 
-        import threading
-
-        threading.Thread(target=_run, daemon=True).start()
+        threading.Thread(target=_run, daemon=True, name="voiceflow-teach-fact").start()
 
     def _on_open_memory_file(self, _sender) -> None:
-        import subprocess
-
         subprocess.run(["open", str(MEMORY_PATH)], check=False)
 
     def _on_clear_memory(self, _sender) -> None:
@@ -440,10 +694,15 @@ class VoiceFlowApp(rumps.App):
         sender.state = new_value
         self.config.set("ui.sound_feedback", new_value)
 
-    def _on_toggle_launch_at_login(self, sender) -> None:
-        import sys as _sys
+    def _on_toggle_hud(self, sender) -> None:
+        new_value = not self.config.get("ui.show_hud", True)
+        sender.state = new_value
+        self.config.set("ui.show_hud", new_value)
+        if not new_value:
+            self.hud.hide()
 
-        app_path = _sys.executable
+    def _on_toggle_launch_at_login(self, sender) -> None:
+        app_path = sys.executable
         # When bundled by py2app, sys.executable points inside VoiceFlow.app/Contents/MacOS/.
         # Walk up to the .app bundle itself for the LaunchAgent to open.
         marker = ".app/Contents/MacOS"
@@ -466,11 +725,9 @@ class VoiceFlowApp(rumps.App):
         permissions.open_input_monitoring_settings()
 
     def _on_show_hotkey_help(self, _sender) -> None:
-        rumps.alert(title="How VoiceFlow's Hotkey Works", message=onboarding.HOTKEY_HELP, ok="Got it")
+        rumps.alert(title="How VoiceFlow Works", message=onboarding.HOTKEY_HELP, ok="Got it")
 
     def _on_view_logs(self, _sender) -> None:
-        import subprocess
-
         subprocess.run(["open", str(LOG_PATH)], check=False)
 
     def _on_about(self, _sender) -> None:
@@ -487,10 +744,39 @@ class VoiceFlowApp(rumps.App):
                 self.hotkey_listener.stop()
         except Exception:
             logger.exception("Error stopping hotkey listener on quit")
+        try:
+            if self._meeting_timer is not None:
+                self._meeting_timer.stop()
+            if self.meeting_session is not None and self.meeting_session.is_active:
+                self.meeting_session.stop()
+        except Exception:
+            logger.exception("Error stopping meeting notes session on quit")
         rumps.quit_application()
 
-    def _first_run_prompt(self) -> None:
-        rumps.alert(title="Welcome to VoiceFlow", message=onboarding.NO_PROVIDER_MESSAGE, ok="OK")
+    # ------------------------------------------------------------------ #
+    # First-run onboarding
+    #
+    # IMPORTANT: this must never be able to block the app or loop. An
+    # earlier version used a repeating rumps.Timer as if it were a one-shot
+    # delay and paired it with a blocking modal rumps.alert() - since the
+    # timer actually fires every interval forever until explicitly stopped,
+    # it kept reopening the alert the instant it was dismissed, making the
+    # app unusable. Fixed by (a) stopping the timer the first time it
+    # fires, so it only ever runs once, and (b) using a passive, non-
+    # blocking notification here instead of a modal alert, so even if this
+    # logic had a bug again it could never trap anyone in a dialog loop.
+    # ------------------------------------------------------------------ #
+    def _schedule_first_run_check(self) -> None:
+        self._first_run_timer = rumps.Timer(self._on_first_run_timer_fired, 1.5)
+        self._first_run_timer.start()
+
+    def _on_first_run_timer_fired(self, sender) -> None:
+        sender.stop()
+        if self.config.get("ui.onboarding_shown", False):
+            return
+        self.config.set("ui.onboarding_shown", True)
+        if not self.config.has_any_provider_configured():
+            self._notify("Welcome to VoiceFlow 👋", onboarding.QUICK_SETUP_NOTIFICATION, NotifyLevel.INFO)
 
 
 def run() -> None:

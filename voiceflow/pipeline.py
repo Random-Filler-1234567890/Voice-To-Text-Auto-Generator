@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from voiceflow.ai.errors import AllProvidersFailedError, NoProviderConfiguredError
-from voiceflow.ai.prompts import strip_learn_prefix
-from voiceflow.clipboard.injector import InjectionError
+from voiceflow.ai.prompts import strip_prefix
+from voiceflow.clipboard.injector import InjectionError, PyperclipBackend
 from voiceflow.config import ConfigManager
 from voiceflow.context.app_profiles import AppCategory, AppProfile, get_profile
 from voiceflow.state import AppState, StateManager
@@ -38,7 +38,7 @@ _DEFAULT_PROFILE = AppProfile(
 
 @dataclass
 class PipelineResult:
-    kind: str  # "injected" | "learned" | "ignored_too_short" | "ignored_empty" | "injection_failed"
+    kind: str  # "injected" | "learned" | "edited" | "ignored_too_short" | "ignored_empty" | "injection_failed"
     text: Optional[str] = None
     learned_count: int = 0
 
@@ -61,6 +61,9 @@ class DictationPipeline:
         context_detector,
         on_notify: Optional[Callable[[str, str, str], None]] = None,
         on_result: Optional[Callable[[PipelineResult], None]] = None,
+        history=None,
+        stats=None,
+        clipboard_reader=None,
     ) -> None:
         self._config = config
         self._state = state
@@ -72,6 +75,9 @@ class DictationPipeline:
         self._context = context_detector
         self._on_notify = on_notify or (lambda title, msg, level: None)
         self._on_result = on_result or (lambda result: None)
+        self._history = history
+        self._stats = stats
+        self._clipboard_reader = clipboard_reader or PyperclipBackend()
         self._captured_context = None
 
     # ------------------------------------------------------------------ #
@@ -166,12 +172,18 @@ class DictationPipeline:
             return
 
         learn_prefixes = self._config.get("formatting.learn_prefixes", ["learn:", "remember:"])
-        is_learn, remainder = strip_learn_prefix(raw_text, learn_prefixes)
-
+        is_learn, learn_remainder = strip_prefix(raw_text, learn_prefixes)
         if is_learn:
-            self._handle_learn(remainder or raw_text, generation)
-        else:
-            self._handle_dictation(raw_text, generation)
+            self._handle_learn(learn_remainder or raw_text, generation)
+            return
+
+        edit_prefixes = self._config.get("formatting.edit_prefixes", ["edit:", "rewrite:"])
+        is_edit, edit_remainder = strip_prefix(raw_text, edit_prefixes)
+        if is_edit and edit_remainder:
+            self._handle_edit_command(edit_remainder, generation)
+            return
+
+        self._handle_dictation(raw_text, generation)
 
     def _handle_learn(self, statement: str, generation: int) -> None:
         if not self._state.transition(AppState.LEARNING):
@@ -197,6 +209,9 @@ class DictationPipeline:
         if added:
             summary = "; ".join(f"[{e.category}] {e.text}" for e in added[:3])
             self._on_notify("VoiceFlow learned something new", summary, NotifyLevel.INFO)
+            if self._stats is not None:
+                for _ in added:
+                    self._stats.record_fact_learned()
         else:
             self._on_notify(
                 "VoiceFlow", "Didn't find a clear fact to learn from that.", NotifyLevel.INFO
@@ -265,7 +280,75 @@ class DictationPipeline:
         # The keystroke has been sent; we're done from the app's point of
         # view even though the clipboard-restore timer is still pending.
         self._state.transition(AppState.IDLE)
+        if self._history is not None:
+            app_name = self._captured_context.app_name if self._captured_context else ""
+            self._history.record(formatted, app_name=app_name)
+        if self._stats is not None:
+            self._stats.record_dictation(len(formatted.split()))
         self._on_result(PipelineResult(kind="injected", text=formatted))
+
+    def _handle_edit_command(self, instruction: str, generation: int) -> None:
+        """The 'Edit:'/'Rewrite:' voice command - rewrite whatever's on the
+        clipboard per a spoken instruction, then paste the result back."""
+        if not self._state.transition(AppState.EDITING):
+            return
+
+        try:
+            target_text = self._clipboard_reader.paste()
+        except Exception:
+            logger.exception("Failed to read clipboard for edit command")
+            target_text = ""
+
+        if not target_text or not target_text.strip():
+            self._on_notify(
+                "VoiceFlow",
+                "No text on your clipboard to edit - copy something first, then say "
+                "\"Edit: ...\" again.",
+                NotifyLevel.ERROR,
+            )
+            self._state.force_idle()
+            self._on_result(PipelineResult(kind="ignored_empty"))
+            return
+
+        try:
+            rewritten = self._formatting.rewrite_text(instruction, target_text)
+        except NoProviderConfiguredError as exc:
+            self._fail(str(exc), configure_hint=True)
+            return
+        except AllProvidersFailedError as exc:
+            self._fail(f"Couldn't process the edit command: {exc}")
+            return
+        except Exception:
+            logger.exception("Unexpected error during edit/rewrite command")
+            self._fail("Couldn't process the edit command unexpectedly.")
+            return
+
+        if not self._state.is_current_generation(generation):
+            return
+
+        if not self._state.transition(AppState.INJECTING):
+            return
+
+        try:
+            self._injector.inject(rewritten)
+        except InjectionError as exc:
+            logger.error("Injection failed after edit command: %s", exc)
+            self._on_notify(
+                "VoiceFlow",
+                "Rewrote it, but couldn't paste automatically - it's on your "
+                "clipboard, press Cmd+V to paste it yourself.",
+                NotifyLevel.ERROR,
+            )
+            try:
+                PyperclipBackend().copy(rewritten)
+            except Exception:
+                logger.exception("Even the clipboard-only fallback failed")
+            self._state.force_idle()
+            self._on_result(PipelineResult(kind="injection_failed", text=rewritten))
+            return
+
+        self._state.transition(AppState.IDLE)
+        self._on_result(PipelineResult(kind="edited", text=rewritten))
 
     def _on_generation_idle(self, generation: int) -> None:
         # Purely informational hook point for the restore-completed timer;

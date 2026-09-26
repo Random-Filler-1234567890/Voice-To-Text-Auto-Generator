@@ -35,9 +35,21 @@ def _default_app_support_dir() -> Path:
 APP_SUPPORT_DIR = _default_app_support_dir()
 CONFIG_PATH = APP_SUPPORT_DIR / "config.json"
 MEMORY_PATH = APP_SUPPORT_DIR / "memory.json"
+HISTORY_PATH = APP_SUPPORT_DIR / "history.json"
+STATS_PATH = APP_SUPPORT_DIR / "stats.json"
 LOG_DIR = APP_SUPPORT_DIR / "logs"
 LOG_PATH = LOG_DIR / "voiceflow.log"
 RECORDINGS_DIR = APP_SUPPORT_DIR / "recordings"  # only used if debug save is enabled
+
+
+def _default_meeting_notes_dir() -> Path:
+    override = os.environ.get("VOICEFLOW_MEETING_NOTES_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / "Documents" / "VoiceFlow Notes"
+
+
+MEETING_NOTES_DIR = _default_meeting_notes_dir()
 
 
 def ensure_directories() -> None:
@@ -45,3 +57,7 @@ def ensure_directories() -> None:
     APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_meeting_notes_dir() -> None:
+    MEETING_NOTES_DIR.mkdir(parents=True, exist_ok=True)
