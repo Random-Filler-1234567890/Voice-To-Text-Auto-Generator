@@ -6,31 +6,40 @@
 # Linux/Windows will fail on those two lines - that's expected, since VoiceFlow
 # is a macOS-only menu bar application. The pure-logic modules and test suite
 # are exercised on any platform; see tests/README.md.
+#
+# Version bounds below are deliberately minimum-version ("floors"), not exact
+# pins. PyObjC's own maintainers release the whole pyobjc-* family together
+# and recommend letting pip resolve each to whatever the latest matching
+# release is for your Python version, rather than forcing one exact micro
+# version that might not have a prebuilt wheel yet for a newer Python/macOS -
+# that's a real failure mode ("no matching distribution found") that an exact
+# pin can hit on a Mac provisioned after this was written, while a floor lets
+# pip just pick current-latest instead.
 
 # --- macOS UI / system integration ---
-rumps==0.4.0                 # native macOS menu bar app shell
-pyobjc-core==10.3.1           # ObjC bridge (NSWorkspace, AXUIElement, AppKit windows)
-pyobjc-framework-Cocoa==10.3.1
-pyobjc-framework-Quartz==10.3.1
-pyobjc-framework-ApplicationServices==10.3.1
+rumps>=0.4.0                    # native macOS menu bar app shell
+pyobjc-core>=10.1                # ObjC bridge (NSWorkspace, AXUIElement, AppKit windows)
+pyobjc-framework-Cocoa>=10.1
+pyobjc-framework-Quartz>=10.1
+pyobjc-framework-ApplicationServices>=10.1
 
 # --- Global hotkeys & keyboard simulation ---
-pynput==1.7.7
+pynput>=1.7.6
 
 # --- Audio capture ---
-sounddevice==0.4.7
-numpy==1.26.4
+sounddevice>=0.4.6
+numpy>=1.26
 
 # --- Clipboard ---
-pyperclip==1.9.0
+pyperclip>=1.8.2
 
 # --- Networking ---
-requests==2.32.3
+requests>=2.31
 
 # --- Packaging ---
-py2app==0.28.8
+py2app>=0.28
 
 # --- Optional: fully offline local transcription fallback ---
 # Uncomment to enable the local faster-whisper fallback provider.
 # This downloads a Whisper model (~150MB-1.5GB depending on size) on first use.
-# faster-whisper==1.0.3
+# faster-whisper>=1.0

@@ -28,6 +28,15 @@ logger = logging.getLogger("voiceflow.pipeline")
 
 MIN_RECORDING_SECONDS = 0.25
 
+# Peak amplitude (0.0-1.0) below which a recording is treated as
+# effectively silent - wrong input device selected, microphone muted, OS
+# mic permission not actually granted, etc. Chosen conservatively low so it
+# only fires for genuine silence, never for someone just speaking quietly;
+# skipping the transcription API call in that case is both faster and
+# avoids burning a request on audio that's essentially guaranteed to come
+# back empty anyway.
+MIN_USEFUL_PEAK_AMPLITUDE = 0.01
+
 _DEFAULT_PROFILE = AppProfile(
     AppCategory.DEFAULT,
     "Default",
@@ -38,7 +47,9 @@ _DEFAULT_PROFILE = AppProfile(
 
 @dataclass
 class PipelineResult:
-    kind: str  # "injected" | "learned" | "edited" | "ignored_too_short" | "ignored_empty" | "injection_failed"
+    # "injected" | "learned" | "edited" | "ignored_too_short" | "ignored_silent"
+    # | "ignored_empty" | "injection_failed"
+    kind: str
     text: Optional[str] = None
     learned_count: int = 0
 
@@ -149,6 +160,21 @@ class DictationPipeline:
             self._on_result(PipelineResult(kind="ignored_too_short"))
             return
 
+        if recording_result.peak_amplitude < MIN_USEFUL_PEAK_AMPLITUDE:
+            logger.info(
+                "Recording had negligible audio level (peak=%.4f); skipping transcription",
+                recording_result.peak_amplitude,
+            )
+            self._state.force_idle()
+            self._on_notify(
+                "VoiceFlow",
+                "Didn't detect any audio - check that the right microphone is selected "
+                "(menu -> Audio -> Input Device) and that it isn't muted.",
+                NotifyLevel.ERROR,
+            )
+            self._on_result(PipelineResult(kind="ignored_silent"))
+            return
+
         try:
             raw_text = self._transcription.transcribe(recording_result.wav_bytes)
         except NoProviderConfiguredError as exc:
@@ -168,6 +194,13 @@ class DictationPipeline:
         if not raw_text.strip():
             logger.info("Empty transcript (silence?); ignoring")
             self._state.force_idle()
+            if recording_result.clipped:
+                self._on_notify(
+                    "VoiceFlow",
+                    "Didn't catch that - your audio was clipping (too loud). Try lowering "
+                    "your microphone input volume in System Settings.",
+                    NotifyLevel.ERROR,
+                )
             self._on_result(PipelineResult(kind="ignored_empty"))
             return
 

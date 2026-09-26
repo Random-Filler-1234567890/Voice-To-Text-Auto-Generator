@@ -23,6 +23,16 @@ except ImportError:
     )
     raise
 
+from voiceflow.logging_setup import configure_logging
+
+# Logging is brought up before anything else in this file imports so that
+# even a failure in the "defensively-imported optional features" block
+# below - which happens at module-import time - lands in the persistent
+# log file, not just stderr (which is invisible once VoiceFlow is a
+# double-clicked .app with no attached terminal). configure_logging() is
+# idempotent, so run()'s own call to it later is a harmless no-op.
+configure_logging()
+
 from voiceflow import __version__
 from voiceflow.ai.formatter import FormattingService
 from voiceflow.ai.providers import validate_api_key
@@ -31,22 +41,99 @@ from voiceflow.audio.recorder import AudioRecorder
 from voiceflow.clipboard.injector import ClipboardInjector, PyperclipBackend
 from voiceflow.config import ConfigManager
 from voiceflow.context.macos_context import ActiveAppDetector
-from voiceflow.history import DictationHistory
 from voiceflow.hotkeys.listener import DEFAULT_KEY, SUPPORTED_KEYS, GlobalHotkeyListener
 from voiceflow.hotkeys.state_machine import HotkeyEvent, HotkeyMode
-from voiceflow.logging_setup import configure_logging
-from voiceflow.meeting import MeetingNotesSession
 from voiceflow.memory.store import MemoryStore
 from voiceflow.paths import LOG_PATH, MEETING_NOTES_DIR, MEMORY_PATH
 from voiceflow.pipeline import DictationPipeline, NotifyLevel, PipelineResult
 from voiceflow.state import AppState, StateManager
-from voiceflow.stats import UsageStats
 from voiceflow.ui import launch_agent, onboarding, permissions, sounds
-from voiceflow.ui.hud import ListeningHUD
 
 logger = logging.getLogger("voiceflow.app")
 
 GROQ_SIGNUP_URL = "https://console.groq.com/keys"
+
+# ---------------------------------------------------------------------- #
+# Defensively-imported optional features.
+#
+# The core dictation loop above (config, state, pipeline, AI providers,
+# clipboard, hotkey) is what actually matters and must never fail to
+# import. Everything below is an *enhancement* on top of that loop - if
+# any one of these modules ever fails to import for any reason (a
+# packaging quirk, a PyObjC/AppKit version mismatch on hud.py, anything),
+# the whole app must still launch with that one feature simply missing,
+# rather than refusing to start at all. Each failure is logged so it's
+# visible in the log file, but never re-raised.
+# ---------------------------------------------------------------------- #
+try:
+    from voiceflow.history import DictationHistory
+except Exception:
+    logger.exception("DictationHistory unavailable - Recent Dictations will be disabled")
+    DictationHistory = None
+
+try:
+    from voiceflow.stats import UsageStats
+except Exception:
+    logger.exception("UsageStats unavailable - the usage stats line will be disabled")
+    UsageStats = None
+
+try:
+    from voiceflow.meeting import MeetingNotesSession
+except Exception:
+    logger.exception("MeetingNotesSession unavailable - Meeting Notes will be disabled")
+    MeetingNotesSession = None
+
+try:
+    from voiceflow.ui.hud import ListeningHUD
+except Exception:
+    logger.exception("ListeningHUD unavailable - the floating listening indicator will be disabled")
+    ListeningHUD = None
+
+
+class _NullHud:
+    """Stand-in used if ListeningHUD couldn't be imported - every call is a no-op."""
+
+    def show(self, text: str) -> None:
+        pass
+
+    def hide(self) -> None:
+        pass
+
+    def update_text(self, text: str) -> None:
+        pass
+
+
+class _NullHistory:
+    """Stand-in used if DictationHistory couldn't be imported."""
+
+    def record(self, text: str, app_name: str = "") -> None:
+        pass
+
+    def recent(self, limit: int = 10) -> list:
+        return []
+
+    def clear(self) -> None:
+        pass
+
+    def count(self) -> int:
+        return 0
+
+
+class _NullStats:
+    """Stand-in used if UsageStats couldn't be imported."""
+
+    def record_dictation(self, word_count: int) -> None:
+        pass
+
+    def record_fact_learned(self) -> None:
+        pass
+
+    def record_meeting(self, word_count: int) -> None:
+        pass
+
+    def summary_line(self) -> str:
+        return "Usage stats unavailable"
+
 
 _STATE_TITLES = {
     AppState.IDLE: "🎙",
@@ -86,12 +173,17 @@ class VoiceFlowApp(rumps.App):
         self.config = ConfigManager()
         self.state = StateManager()
         self.memory = MemoryStore(max_entries=self.config.get("memory.max_entries", 2000))
-        self.history = DictationHistory(max_entries=self.config.get("history.max_entries", 50))
-        self.stats = UsageStats()
+        self.history = self._build_optional(
+            DictationHistory,
+            _NullHistory,
+            "history",
+            max_entries=self.config.get("history.max_entries", 50),
+        )
+        self.stats = self._build_optional(UsageStats, _NullStats, "usage stats")
         self.context_detector = ActiveAppDetector()
         self.transcription_service = TranscriptionService(self.config)
         self.formatting_service = FormattingService(self.config)
-        self.hud = ListeningHUD()
+        self.hud = self._build_optional(ListeningHUD, _NullHud, "listening indicator")
 
         self.audio_recorder = AudioRecorder(
             sample_rate=self.config.get("audio.sample_rate", 16000),
@@ -131,15 +223,31 @@ class VoiceFlowApp(rumps.App):
 
         self._schedule_first_run_check()
 
+    def _build_optional(self, cls, fallback_cls, feature_name: str, **kwargs):
+        """Construct an optional-feature object, falling back to a no-op
+        stand-in if the real class failed to import OR raises during
+        construction - either way, that one feature is disabled instead of
+        the whole app failing to launch."""
+        if cls is None:
+            return fallback_cls()
+        try:
+            return cls(**kwargs)
+        except Exception:
+            logger.exception("Failed to initialize %s; disabling that feature", feature_name)
+            return fallback_cls()
+
     # ------------------------------------------------------------------ #
     # Menu construction
     # ------------------------------------------------------------------ #
     def _build_menu(self) -> None:
         self.status_item = rumps.MenuItem("Status: Idle")
         self.toggle_item = rumps.MenuItem("Start Dictation", callback=self._on_toggle_clicked)
-        self.meeting_item = rumps.MenuItem(
-            "Start Meeting Notes", callback=self._on_toggle_meeting_notes
-        )
+        if MeetingNotesSession is not None:
+            self.meeting_item = rumps.MenuItem(
+                "Start Meeting Notes", callback=self._on_toggle_meeting_notes
+            )
+        else:
+            self.meeting_item = rumps.MenuItem("Meeting Notes (unavailable)", callback=None)
 
         hotkey_menu = self._build_hotkey_menu()
         providers_menu = self._build_providers_menu()
@@ -438,6 +546,12 @@ class VoiceFlowApp(rumps.App):
             )
 
     def _start_meeting_notes(self) -> None:
+        if MeetingNotesSession is None:
+            self._notify(
+                "VoiceFlow", "Meeting Notes isn't available in this build.", NotifyLevel.ERROR
+            )
+            return
+
         if not self.state.transition(AppState.MEETING):
             return
 

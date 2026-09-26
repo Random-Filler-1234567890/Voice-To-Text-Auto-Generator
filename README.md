@@ -15,7 +15,7 @@ not on a Mac. Every platform-independent module - configuration, the
 hotkey timing state machine, the personal-memory relevance ranking, prompt
 construction, the AI provider fallback chains, the clipboard-injection
 logic, meeting-notes chunking, and the full pipeline orchestration - has a
-real, passing `pytest` suite (172 tests) that ran in that sandbox and is
+real, passing `pytest` suite (183 tests) that ran in that sandbox and is
 included in `tests/`. Run it yourself any time with `pytest`.
 
 What could **not** be built or tested here: the actual macOS `.app` bundle,
@@ -32,20 +32,48 @@ below as the single riskiest piece of UI code in the app.
 
 ## Changelog
 
-**Since the first version you installed:**
+**Round 2 (reliability hardening, after "nothing happens when I open it"):**
+
+Your report that a fully clean reinstall still did nothing on launch was
+the most important signal I've gotten so far, because a silent failure
+with zero error text is the single hardest thing to diagnose blind. Rather
+than guess again, I made three structural changes that target exactly that
+failure mode, whatever its exact cause turns out to be:
+
+- **`main.py` now catches everything.** Any failure at all while starting
+  up - anywhere, for any reason - writes a full error report to
+  `~/Library/Application Support/VoiceFlow/logs/crash.log` and pops up a
+  native macOS alert telling you so. "Nothing happens" should no longer be
+  possible even if there's still a bug somewhere: you'll now see *what*
+  broke instead of silence.
+- **Every optional feature added last round (the floating indicator,
+  Meeting Notes, Recent Dictations, usage stats) is now individually
+  fault-isolated.** If any single one of them fails to load for any reason
+  (a PyObjC version mismatch, anything), the rest of the app - including
+  core dictation - still starts up fine with just that one feature quietly
+  disabled, instead of the whole app refusing to launch over it.
+- **The build script now tests itself before saying "done."** It verifies
+  the code imports cleanly, then actually launches the built `.app` and
+  confirms it's still running a few seconds later, *before* telling you
+  the build succeeded. `update_macos_app.sh` only reports success if this
+  self-check passed - it will no longer say "Done!" over a broken build
+  the way it did before.
+- Also added: audio-quality-aware notifications (an actionable message
+  when it detects near-silence or clipping instead of just failing
+  quietly), and relaxed several exact dependency version pins that could
+  fail to install on a newer Python/macOS than this was written against.
+
+**Round 1 (feature round, after the alert-loop bug):**
 
 - **Fixed:** the "Welcome to VoiceFlow" popup that kept reopening and
   blocked the app from being usable. Root cause: an internal timer meant
   to fire once was actually a *repeating* timer, so the alert reappeared
-  every ~1 second forever. Onboarding now uses a genuinely one-shot timer
-  and a passive, non-blocking notification instead of a modal popup, so
-  this specific failure mode can't happen again even if a future change
-  reintroduces a timing bug.
+  every ~1 second forever.
 - **Added: Quick Setup.** Menu -> AI Providers -> Quick Setup opens Groq's
   free key page in your browser, then prompts you to paste the key in, and
-  validates it live against Groq's API with a real pass/fail message - no
-  more silently saving a bad key. One key covers both transcription and
-  formatting; see **How the AI actually works** below.
+  validates it live against Groq's API with a real pass/fail message. One
+  key covers both transcription and formatting; see **How the AI actually
+  works** below.
 - **Added: floating listening indicator**, like Wispr Flow's - a small
   pill appears near the bottom of your screen while VoiceFlow is
   listening/thinking and disappears the instant it's done. Toggle it off
@@ -113,30 +141,64 @@ below as the single riskiest piece of UI code in the app.
 
 You need a Mac (macOS 11+) and about five minutes. This is a **one-time**
 Terminal step to produce the app - after that you never need Terminal
-again.
+again. Two commands, run one at a time:
 
 ```bash
-git clone <this-repo-url> VoiceFlow
+git clone https://github.com/random-filler-1234567890/voice-to-text-auto-generator.git VoiceFlow
 cd VoiceFlow
+```
+
+```bash
 ./build_macos_app.sh
 ```
 
-The script creates a virtual environment, installs dependencies, builds
-the app icon, and packages everything into `dist/VoiceFlow.app`. Then:
+That second command does the whole build **and checks its own work**: it
+installs everything into a private virtual environment, verifies the code
+actually imports cleanly, packages `dist/VoiceFlow.app`, then launches
+that app for a few seconds to confirm it stays running - before it ever
+tells you it succeeded. If any of that fails, it stops and prints exactly
+what went wrong instead of a false "done."
 
-1. `cp -R dist/VoiceFlow.app /Applications/` (or drag it in Finder).
-2. Open VoiceFlow from Applications or Spotlight.
-3. macOS will ask for **Microphone**, **Accessibility**, and **Input
+If it reports success, VoiceFlow is already running. From there:
+
+1. **Move it into Applications** so it stays put:
+   ```bash
+   cp -R dist/VoiceFlow.app /Applications/ && killall VoiceFlow
+   open /Applications/VoiceFlow.app
+   ```
+2. macOS will ask for **Microphone**, **Accessibility**, and **Input
    Monitoring** permissions the first time - approve all three (System
    Settings -> Privacy & Security), then quit and reopen VoiceFlow once.
    The menu's "Permissions & Setup Guide..." item walks you through this
    and jumps straight to each settings pane.
-4. Click the menu bar icon -> **AI Providers** -> **Quick Setup...** - it
+3. Click the menu bar icon -> **AI Providers** -> **Quick Setup...** - it
    opens Groq's free key page in your browser, then asks you to paste the
    key in, and confirms it works before you continue. Takes under a
    minute; see **How the AI actually works** below for why this step can't
    be skipped entirely.
-5. Hold **Right Option** anywhere and speak. Release to paste.
+4. Hold **Right Option** anywhere and speak. Release to paste.
+
+If macOS refuses to open it ("cannot be opened because it is from an
+unidentified developer" - expected, since this is an unsigned personal
+build, not something from the App Store): right-click `VoiceFlow.app` ->
+**Open** -> **Open**. You only need to do this once.
+
+### If the build script reports a failure
+
+It'll tell you which check failed (import error vs. the app not staying
+running) and point you at two places: a saved crash report at
+`~/Library/Application Support/VoiceFlow/logs/crash.log`, and:
+
+```bash
+./run_dev.sh
+```
+
+`run_dev.sh` runs VoiceFlow straight from source, attached to your
+terminal, so any error prints right there instead of vanishing into a
+double-clicked app with no console. Copy whatever it prints back to me (or
+fix it yourself, if the traceback makes the problem obvious) - that's the
+single most useful piece of information for tracking down anything that
+isn't already caught by the checks above.
 
 ## How the AI actually works
 
@@ -159,23 +221,6 @@ down), not a requirement. The key is stored only in
 that provider's API, directly from your Mac - it never passes through any
 server of mine.
 
-If macOS refuses to open it ("cannot be opened because it is from an
-unidentified developer" - expected, since this is an unsigned personal
-build, not something from the App Store): right-click `VoiceFlow.app` ->
-**Open** -> **Open**. You only need to do this once.
-
-### If something goes wrong on first launch
-
-Run it from source instead, so you get a real Python traceback in the
-terminal instead of a silently-failed menu bar icon:
-
-```bash
-./run_dev.sh
-```
-
-Fix whatever the traceback shows (or send it to me), then re-run
-`build_macos_app.sh` to rebuild the `.app`.
-
 ## Updating
 
 VoiceFlow doesn't auto-update (that needs a signed app + an update server,
@@ -186,12 +231,15 @@ cd VoiceFlow   # wherever you cloned it
 ./update_macos_app.sh
 ```
 
-This pulls the latest code, quits the running app, rebuilds it, replaces
-`/Applications/VoiceFlow.app`, and reopens it - so "update through GitHub"
-really just means running that one script whenever you're told there's a
-new version. Your config, memory, history, and stats all live outside the
-`.app` bundle (in `~/Library/Application Support/VoiceFlow/`), so updating
-never touches or resets any of that.
+This pulls the latest code, quits the running app, rebuilds and
+self-tests it (same checks as `build_macos_app.sh` - import check + a real
+launch-and-stay-running check), replaces `/Applications/VoiceFlow.app`,
+and reopens it. It only prints "Done!" if that self-test actually passed -
+if anything's broken it stops and tells you what, instead of claiming
+success over a build that doesn't work. Your config, memory, history, and
+stats all live outside the `.app` bundle (in
+`~/Library/Application Support/VoiceFlow/`), so updating never touches or
+resets any of that.
 
 ## How the hotkey works
 
@@ -287,7 +335,10 @@ voiceflow/
   stats.py                 Usage counters + estimated time-saved heuristic
   logging_setup.py       Rotating file + console logging, global exception hooks
   paths.py                Central filesystem paths (~/Library/Application Support/VoiceFlow)
-  main.py / app.py       Entry point + the rumps menu bar application
+  main.py                 Entry point - a paranoid try/except around everything that writes
+                          a crash log + shows a native alert on any startup failure (see below)
+  app.py                   The rumps menu bar application; optional features (history/stats/
+                          meeting/HUD) import defensively so one broken module can't sink the app
 
   hotkeys/
     state_machine.py     Pure-logic hold/toggle/double-tap-latch interaction FSM (fully unit tested)
@@ -318,7 +369,7 @@ voiceflow/
     onboarding.py, permissions.py, sounds.py, launch_agent.py
                              Setup copy, System Settings deep links, sound feedback, launch-at-login
 
-tests/                    172 pytest tests covering every module above except the macOS-only adapters
+tests/                    183 pytest tests covering every module above except the macOS-only adapters
                           (hud.py, listener.py, macos_context.py, injector.py's real backends, app.py)
 ```
 
@@ -365,3 +416,13 @@ To set expectations correctly rather than over-promise:
 - Distribution is unsigned (no Apple Developer Program membership was
   available to sign/notarize this from here), so the standard
   right-click-Open dance is needed once. Nothing else changes.
+- **On "verified end-to-end on a real Mac":** I genuinely cannot run this
+  app myself. What I can do, and have done as thoroughly as the
+  environment allows: a 183-test suite covering every line of decision
+  logic that doesn't require a real display; a build script that now
+  actually launches the finished `.app` and confirms it stays running
+  before declaring success; and a crash handler that guarantees any
+  remaining failure shows you the real error instead of nothing. If
+  something still breaks after all of that, the fastest path to a fix is
+  always the same: run `./run_dev.sh` and send me exactly what it prints -
+  that's real signal, where "it doesn't work" isn't.

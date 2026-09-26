@@ -241,6 +241,69 @@ def test_empty_transcript_is_ignored(tmp_path):
     assert state.state == AppState.IDLE
 
 
+def test_silent_recording_skips_transcription_and_notifies(tmp_path):
+    transcription = FakeTranscriptionService()
+    pipeline, state, notifications, results = make_pipeline(tmp_path, transcription=transcription)
+    state.new_generation()
+    state.transition(AppState.RECORDING)
+    state.transition(AppState.TRANSCRIBING)
+    silent_result = FakeRecordingResult(peak_amplitude=0.0)
+    pipeline._process(silent_result, state.generation)
+
+    assert transcription.calls == []  # never even attempted transcription - saves an API call
+    assert results[-1].kind == "ignored_silent"
+    assert state.state == AppState.IDLE
+    assert any("microphone" in msg.lower() for _, msg, _ in notifications)
+
+
+def test_quiet_but_audible_recording_still_gets_transcribed(tmp_path):
+    # Only near-total silence should short-circuit - a quietly-spoken but
+    # genuinely audible recording must still go through transcription.
+    transcription = FakeTranscriptionService(text="a quiet whisper")
+    injector = FakeInjector()
+    pipeline, state, notifications, results = make_pipeline(
+        tmp_path, transcription=transcription, injector=injector
+    )
+    state.new_generation()
+    state.transition(AppState.RECORDING)
+    state.transition(AppState.TRANSCRIBING)
+    quiet_result = FakeRecordingResult(peak_amplitude=0.05)
+    pipeline._process(quiet_result, state.generation)
+
+    assert len(transcription.calls) == 1
+    assert results[-1].kind == "injected"
+
+
+def test_clipped_empty_transcript_mentions_clipping(tmp_path):
+    pipeline, state, notifications, results = make_pipeline(
+        tmp_path, transcription=FakeTranscriptionService(text="")
+    )
+    state.new_generation()
+    state.transition(AppState.RECORDING)
+    state.transition(AppState.TRANSCRIBING)
+    clipped_result = FakeRecordingResult(peak_amplitude=0.5, clipped=True)
+    pipeline._process(clipped_result, state.generation)
+
+    assert results[-1].kind == "ignored_empty"
+    assert any("clipping" in msg.lower() for _, msg, _ in notifications)
+
+
+def test_empty_transcript_without_clipping_stays_quiet(tmp_path):
+    # No audio-quality issue detected - don't nag the user over an ordinary
+    # brief/ambiguous utterance that just happened to transcribe empty.
+    pipeline, state, notifications, results = make_pipeline(
+        tmp_path, transcription=FakeTranscriptionService(text="")
+    )
+    state.new_generation()
+    state.transition(AppState.RECORDING)
+    state.transition(AppState.TRANSCRIBING)
+    result = FakeRecordingResult(peak_amplitude=0.5, clipped=False)
+    pipeline._process(result, state.generation)
+
+    assert results[-1].kind == "ignored_empty"
+    assert notifications == []
+
+
 def test_no_provider_configured_notifies_and_resets(tmp_path):
     pipeline, state, notifications, results = make_pipeline(
         tmp_path,
