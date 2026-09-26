@@ -1,0 +1,36 @@
+# Core runtime dependencies for VoiceFlow (macOS)
+#
+# Install with:  pip install -r requirements.txt
+#
+# NOTE: rumps / pyobjc only build correctly on macOS. Installing this file on
+# Linux/Windows will fail on those two lines - that's expected, since VoiceFlow
+# is a macOS-only menu bar application. The pure-logic modules and test suite
+# are exercised on any platform; see tests/README.md.
+
+# --- macOS UI / system integration ---
+rumps==0.4.0                 # native macOS menu bar app shell
+pyobjc-core==10.3.1           # ObjC bridge (NSWorkspace, AXUIElement, AppKit windows)
+pyobjc-framework-Cocoa==10.3.1
+pyobjc-framework-Quartz==10.3.1
+pyobjc-framework-ApplicationServices==10.3.1
+
+# --- Global hotkeys & keyboard simulation ---
+pynput==1.7.7
+
+# --- Audio capture ---
+sounddevice==0.4.7
+numpy==1.26.4
+
+# --- Clipboard ---
+pyperclip==1.9.0
+
+# --- Networking ---
+requests==2.32.3
+
+# --- Packaging ---
+py2app==0.28.8
+
+# --- Optional: fully offline local transcription fallback ---
+# Uncomment to enable the local faster-whisper fallback provider.
+# This downloads a Whisper model (~150MB-1.5GB depending on size) on first use.
+# faster-whisper==1.0.3

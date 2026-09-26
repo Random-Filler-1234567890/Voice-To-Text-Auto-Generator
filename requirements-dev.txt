@@ -1,0 +1,10 @@
+# Dev/test dependencies - safe to install on any platform (Linux/macOS/CI).
+# These let you run the full pytest suite for every platform-independent
+# module without needing a Mac.
+pytest==8.3.3
+pytest-cov==5.0.0
+
+# Only needed if you want to regenerate assets/icon_1024.png via
+# scripts/generate_icon.py - the generated PNG is already committed, so
+# most people never need this.
+Pillow==10.4.0
