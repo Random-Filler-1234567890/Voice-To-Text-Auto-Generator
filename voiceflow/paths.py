@@ -46,7 +46,14 @@ def _default_meeting_notes_dir() -> Path:
     override = os.environ.get("VOICEFLOW_MEETING_NOTES_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / "Documents" / "VoiceFlow Notes"
+    # Deliberately NOT ~/Documents: macOS treats Documents/Desktop/Downloads
+    # as TCC-protected folders requiring their own separate user consent
+    # prompt, which VoiceFlow never requests/declares in Info.plist - an
+    # app writing there without that permission gets a silent
+    # PermissionError. Living under Application Support (which the app
+    # already has unprompted access to, same as config/memory/logs) avoids
+    # that failure mode entirely.
+    return APP_SUPPORT_DIR / "Meeting Notes"
 
 
 MEETING_NOTES_DIR = _default_meeting_notes_dir()

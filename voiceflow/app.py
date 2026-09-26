@@ -11,6 +11,7 @@ import logging
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 
 try:
@@ -45,7 +46,7 @@ from voiceflow.hotkeys.listener import DEFAULT_KEY, SUPPORTED_KEYS, GlobalHotkey
 from voiceflow.hotkeys.state_machine import HotkeyEvent, HotkeyMode
 from voiceflow.memory.store import MemoryStore
 from voiceflow.paths import LOG_PATH, MEETING_NOTES_DIR, MEMORY_PATH
-from voiceflow.pipeline import DictationPipeline, NotifyLevel, PipelineResult
+from voiceflow.pipeline import MIN_USEFUL_PEAK_AMPLITUDE, DictationPipeline, NotifyLevel, PipelineResult
 from voiceflow.state import AppState, StateManager
 from voiceflow.ui import launch_agent, onboarding, permissions, sounds
 
@@ -399,6 +400,8 @@ class VoiceFlowApp(rumps.App):
         )
         self.save_recordings_item.state = self.config.get("audio.save_recordings_for_debug", False)
         menu.add(self.save_recordings_item)
+        menu.add(None)
+        menu.add(rumps.MenuItem("Test Microphone...", callback=self._on_test_microphone))
         return menu
 
     # ------------------------------------------------------------------ #
@@ -563,23 +566,23 @@ class VoiceFlowApp(rumps.App):
                 max_recording_seconds=self.config.get("meeting.chunk_seconds", 20) + 5,
             )
 
-        self.meeting_session = MeetingNotesSession(
-            audio_recorder_factory=_recorder_factory,
-            transcription_service=self.transcription_service,
-            formatting_service=self.formatting_service,
-            chunk_seconds=self.config.get("meeting.chunk_seconds", 20),
-            min_chunk_seconds_to_transcribe=self.config.get(
-                "meeting.min_chunk_seconds_to_transcribe", 1.5
-            ),
-            generate_summary=self.config.get("meeting.generate_summary", True),
-            notes_dir=MEETING_NOTES_DIR,
-            on_notify=self._notify,
-        )
         try:
+            self.meeting_session = MeetingNotesSession(
+                audio_recorder_factory=_recorder_factory,
+                transcription_service=self.transcription_service,
+                formatting_service=self.formatting_service,
+                chunk_seconds=self.config.get("meeting.chunk_seconds", 20),
+                min_chunk_seconds_to_transcribe=self.config.get(
+                    "meeting.min_chunk_seconds_to_transcribe", 1.5
+                ),
+                generate_summary=self.config.get("meeting.generate_summary", True),
+                notes_dir=MEETING_NOTES_DIR,
+                on_notify=self._notify,
+            )
             file_path = self.meeting_session.start()
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to start meeting notes session")
-            self._notify("VoiceFlow", "Couldn't start Meeting Notes.", NotifyLevel.ERROR)
+            self._notify("VoiceFlow", f"Couldn't start Meeting Notes: {exc}", NotifyLevel.ERROR)
             self.meeting_session = None
             self.state.force_idle()
             return
@@ -707,10 +710,14 @@ class VoiceFlowApp(rumps.App):
             dimensions=(320, 22),
         )
         response = window.run()
-        if not (response.clicked and response.text and response.text.strip() != masked):
+        # Deliberately gate on "is there real, different text" rather than
+        # response.clicked - a save this cheap and reversible is safer to
+        # err toward doing than toward silently discarding a key the user
+        # actually typed in, if some button-index assumption turns out to
+        # be wrong for a given rumps/macOS version.
+        key = (response.text or "").strip()
+        if not key or key == masked:
             return
-
-        key = response.text.strip()
         self.config.set(f"providers.{provider}_api_key", key)
         self._notify("VoiceFlow", f"{provider.capitalize()} key saved - verifying...", NotifyLevel.INFO)
 
@@ -740,10 +747,10 @@ class VoiceFlowApp(rumps.App):
             dimensions=(320, 22),
         )
         response = window.run()
-        if not (response.clicked and response.text.strip()):
+        # See _prompt_and_save_key for why this doesn't gate on response.clicked.
+        statement = (response.text or "").strip()
+        if not statement:
             return
-
-        statement = response.text.strip()
 
         def _run():
             try:
@@ -802,6 +809,63 @@ class VoiceFlowApp(rumps.App):
         new_value = not self.config.get("audio.save_recordings_for_debug", False)
         sender.state = new_value
         self.config.set("audio.save_recordings_for_debug", new_value)
+
+    def _on_test_microphone(self, _sender) -> None:
+        """Isolated audio round-trip, independent of AI keys/hotkey/permissions
+        for anything else - the fastest way to tell whether the microphone
+        itself (and macOS's permission for it) is actually working, and to
+        surface the exact error if it isn't. Uses its own throwaway
+        AudioRecorder rather than self.audio_recorder so it can never
+        collide with a real dictation in progress."""
+        if self.state.state != AppState.IDLE:
+            self._notify(
+                "VoiceFlow", "Finish the current action before testing the microphone.", NotifyLevel.INFO
+            )
+            return
+
+        self._notify("VoiceFlow", "Testing microphone for 1.5 seconds - say something...", NotifyLevel.INFO)
+
+        def _run():
+            test_recorder = AudioRecorder(
+                sample_rate=self.config.get("audio.sample_rate", 16000),
+                channels=self.config.get("audio.channels", 1),
+                device=self.config.get("audio.device", None),
+                max_recording_seconds=5,
+            )
+            try:
+                test_recorder.start()
+            except Exception as exc:
+                logger.exception("Microphone test failed to start")
+                self._notify("Microphone Test Failed", str(exc), NotifyLevel.ERROR)
+                return
+
+            time.sleep(1.5)
+
+            try:
+                result = test_recorder.stop()
+            except Exception as exc:
+                logger.exception("Microphone test failed to stop")
+                self._notify("Microphone Test Failed", str(exc), NotifyLevel.ERROR)
+                return
+
+            if result.peak_amplitude < MIN_USEFUL_PEAK_AMPLITUDE:
+                self._notify(
+                    "Microphone Test",
+                    f"Opened the microphone fine, but heard near-silence (peak level "
+                    f"{result.peak_amplitude:.3f}). Check System Settings -> Privacy & "
+                    f"Security -> Microphone (VoiceFlow must be checked), and that the "
+                    f"right input device is selected under Audio -> Input Device.",
+                    NotifyLevel.ERROR,
+                )
+            else:
+                self._notify(
+                    "Microphone Test Passed",
+                    f"Heard you clearly (peak level {result.peak_amplitude:.2f}). "
+                    f"Your microphone is working.",
+                    NotifyLevel.INFO,
+                )
+
+        threading.Thread(target=_run, daemon=True, name="voiceflow-mic-test").start()
 
     def _on_toggle_sound_feedback(self, sender) -> None:
         new_value = not self.config.get("ui.sound_feedback", True)

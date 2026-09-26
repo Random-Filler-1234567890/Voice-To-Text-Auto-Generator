@@ -15,7 +15,7 @@ not on a Mac. Every platform-independent module - configuration, the
 hotkey timing state machine, the personal-memory relevance ranking, prompt
 construction, the AI provider fallback chains, the clipboard-injection
 logic, meeting-notes chunking, and the full pipeline orchestration - has a
-real, passing `pytest` suite (183 tests) that ran in that sandbox and is
+real, passing `pytest` suite (187 tests) that ran in that sandbox and is
 included in `tests/`. Run it yourself any time with `pytest`.
 
 What could **not** be built or tested here: the actual macOS `.app` bundle,
@@ -31,6 +31,36 @@ do - especially the new floating listening indicator, which is flagged
 below as the single riskiest piece of UI code in the app.
 
 ## Changelog
+
+**Round 4 (found the menu, but mic/Meeting Notes/API key were still flaky):**
+
+- **Fixed a real bug: Meeting Notes was writing to `~/Documents/VoiceFlow
+  Notes/`**, and macOS treats Documents (like Desktop and Downloads) as a
+  specially-protected folder requiring its own separate permission prompt
+  - one VoiceFlow never declared or requested. Writing there without it
+  raises a silent `PermissionError`, which is exactly the "weird bug noise
+  and then nothing" - that beep is VoiceFlow's own error sound, played
+  right after that exception got caught. Moved the default location to
+  `~/Library/Application Support/VoiceFlow/Meeting Notes/`, next to
+  everything else VoiceFlow already has unprompted access to. The failure
+  notification also now shows the *actual* error message instead of a
+  generic one, so if something like this happens again, you can just read
+  it to me instead of describing a sound effect.
+- **Hardened the "Save"/"Learn" buttons on the API key and Teach-a-Fact
+  dialogs.** They previously required both "a button was clicked" AND "the
+  text changed" before saving; now they save based on the text alone. If
+  the reported "I put in a key and it didn't work" was this dialog
+  silently discarding a valid entry, it no longer can be.
+- **Added a "Test Microphone..." item** under the Audio menu - runs a
+  1.5-second recording completely independent of AI keys, the hotkey, or
+  anything else, and reports the exact peak audio level it heard (or the
+  exact error if it couldn't open the microphone at all). This is the
+  fastest way to find out whether the mic/permission layer itself is
+  working, in isolation from everything downstream of it.
+- Still want to know why the Microphone permission prompt never appeared
+  for you at all originally - if "Test Microphone" doesn't trigger it
+  either, that's the next real clue; see **Where to find VoiceFlow** and
+  the troubleshooting note there.
 
 **Round 3 (the actual root cause of "nothing happens"):**
 
@@ -102,7 +132,7 @@ failure mode, whatever its exact cause turns out to be:
   continuous, hands-free transcription during a meeting or lecture. It
   keeps recording in ~20s chunks in the background, cleans each one up
   (filler words removed) and appends it with a timestamp to a running
-  Markdown file in `~/Documents/VoiceFlow Notes/`, then adds an AI-written
+  Markdown file (later moved out of `~/Documents` - see Round 3 below), then adds an AI-written
   summary + action items when you stop.
 - **Added: "Edit:"/"Rewrite:" voice command.** Copy some text, say
   "Edit: make this more formal" (or any instruction), and VoiceFlow
@@ -174,6 +204,14 @@ utility is supposed to do; it's how Bartender, and almost certainly Wispr
 Flow itself, work too). If you don't see the icon, check the little `⌃` /
 `>>` overflow chevron near the clock - macOS hides menu-bar icons there
 when the bar gets crowded.
+
+Once you've found it, the fastest way to confirm the rest of the app is
+actually working is **Audio -> Test Microphone...** - it's a completely
+self-contained 1.5-second recording test that doesn't need an API key or
+the hotkey to work first, and it tells you either the exact audio level it
+heard or the exact error if it couldn't open the microphone at all
+(including if that's the very first time macOS's permission prompt shows
+up). Start there before troubleshooting anything else.
 
 ## Quick start (macOS)
 
@@ -313,11 +351,17 @@ Click the menu bar icon -> **Start Meeting Notes**. VoiceFlow records
 continuously in ~20-second chunks (configurable via `meeting.chunk_seconds`),
 transcribes and lightly cleans up each one (filler words removed, but
 nothing summarized away), and appends it with a timestamp to a Markdown
-file in `~/Documents/VoiceFlow Notes/Meeting YYYY-MM-DD HH-MM.md` as the
-meeting happens - so even if something crashes mid-meeting, everything up
-to that point is already safely on disk. Click **Stop Meeting Notes** when
-you're done; VoiceFlow adds an AI-written summary and action-items section
-to the top of the file and opens it for you.
+file in `~/Library/Application Support/VoiceFlow/Meeting Notes/Meeting
+YYYY-MM-DD HH-MM.md` as the meeting happens - so even if something crashes
+mid-meeting, everything up to that point is already safely on disk. Click
+**Stop Meeting Notes** when you're done; VoiceFlow adds an AI-written
+summary and action-items section to the top of the file and opens it for
+you (which is also the easiest way to find the file, if you don't want to
+navigate there by hand). It's deliberately **not** in `~/Documents` - that
+folder requires a separate macOS permission VoiceFlow doesn't request,
+which would otherwise make Meeting Notes fail silently with a permission
+error. Set `VOICEFLOW_MEETING_NOTES_DIR` as an environment variable if you
+want it saved somewhere else instead.
 
 Known limitation: there's a brief (typically 1-3 second) gap between
 chunks while the previous one transcribes, since chunks are processed
@@ -407,7 +451,7 @@ voiceflow/
     onboarding.py, permissions.py, sounds.py, launch_agent.py
                              Setup copy, System Settings deep links, sound feedback, launch-at-login
 
-tests/                    183 pytest tests covering every module above except the macOS-only adapters
+tests/                    187 pytest tests covering every module above except the macOS-only adapters
                           (hud.py, listener.py, macos_context.py, injector.py's real backends, app.py)
 ```
 
