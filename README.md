@@ -32,6 +32,26 @@ below as the single riskiest piece of UI code in the app.
 
 ## Changelog
 
+**Round 3 (the actual root cause of "nothing happens"):**
+
+Found it. It wasn't a crash at all - it was a packaging setting
+(`LSUIElement`) that made VoiceFlow behave as a *regular* foreground app
+instead of a menu-bar-only one. That meant every launch put "VoiceFlow" in
+bold at the **top-left** of the screen next to the Apple logo - the normal
+spot for whatever app is currently active - with an essentially empty
+default menu, since that's not where rumps puts anything. The real, fully
+working menu was sitting the whole time in the status bar at the
+**top-right** (a small microphone icon among your WiFi/battery/clock
+icons), which is easy to miss when a bold "VoiceFlow" label at the
+top-left is confidently telling you to look there instead. Fixed by
+setting `LSUIElement: True`, which is the standard, documented way rumps
+apps (and every other menu-bar-only utility - Bartender, and almost
+certainly Wispr Flow itself) are supposed to be packaged. The tradeoff:
+**VoiceFlow no longer has a Dock icon** - it lives only in the menu bar
+now, which is both the correct behavior for this category of app and the
+only way to remove the confusing dead-end menu for good. See
+**Where to find VoiceFlow** below.
+
 **Round 2 (reliability hardening, after "nothing happens when I open it"):**
 
 Your report that a fully clean reinstall still did nothing on launch was
@@ -136,6 +156,24 @@ failure mode, whatever its exact cause turns out to be:
   in a meeting). Everything - API keys, hotkey, mode, audio device,
   memory, history, logs - is reachable from the menu. No config files to
   hand-edit (though you can, they're plain JSON).
+
+## Where to find VoiceFlow
+
+**There is no Dock icon and no window.** VoiceFlow lives entirely as one
+small icon in the macOS **status bar - the strip at the top-RIGHT of your
+screen**, in the same row as your WiFi, battery, and clock icons. Right
+after opening it, look for a small microphone emoji (🎙) out there and
+click it - that opens the entire menu (Start Dictation, AI Providers,
+Memory, everything).
+
+It will **not** appear as "VoiceFlow" in bold next to the Apple logo at
+the top-left of your screen the way Finder or Safari would when they're
+active - that's the normal spot for a regular foreground app, and
+VoiceFlow is deliberately not one of those (that's what a menu-bar-only
+utility is supposed to do; it's how Bartender, and almost certainly Wispr
+Flow itself, work too). If you don't see the icon, check the little `⌃` /
+`>>` overflow chevron near the clock - macOS hides menu-bar icons there
+when the bar gets crowded.
 
 ## Quick start (macOS)
 

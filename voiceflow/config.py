@@ -84,10 +84,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_chunk_seconds_to_transcribe": 1.5,
     },
     "ui": {
-        "show_dock_icon": True,
         "launch_at_login": False,
         "sound_feedback": True,
-        "menu_bar_icon_style": "waveform",
         "show_hud": True,
         "onboarding_shown": False,
     },
