@@ -90,6 +90,29 @@ except Exception:
     logger.exception("ListeningHUD unavailable - the floating listening indicator will be disabled")
     ListeningHUD = None
 
+try:
+    from voiceflow.ui.main_window import MainWindowController, check_accessibility_permission
+except Exception:
+    logger.exception("MainWindowController unavailable - the main window will be disabled")
+    MainWindowController = None
+    check_accessibility_permission = None
+
+from voiceflow.ui.status_text import format_permission_row, format_state_line
+
+
+class _NullMainWindow:
+    """Stand-in used if MainWindowController couldn't be imported - the menu
+    (which every one of these actions is also reachable from) still works."""
+
+    def show(self) -> None:
+        pass
+
+    def refresh(self) -> None:
+        pass
+
+    def set_key_status_text(self, text: str) -> None:
+        pass
+
 
 class _NullHud:
     """Stand-in used if ListeningHUD couldn't be imported - every call is a no-op."""
@@ -185,6 +208,7 @@ class VoiceFlowApp(rumps.App):
         self.transcription_service = TranscriptionService(self.config)
         self.formatting_service = FormattingService(self.config)
         self.hud = self._build_optional(ListeningHUD, _NullHud, "listening indicator")
+        self._mic_permission_status: bool | None = None
 
         self.audio_recorder = AudioRecorder(
             sample_rate=self.config.get("audio.sample_rate", 16000),
@@ -214,6 +238,26 @@ class VoiceFlowApp(rumps.App):
         self.meeting_session: MeetingNotesSession | None = None
         self._meeting_timer: rumps.Timer | None = None
 
+        self.main_window = self._build_optional(
+            MainWindowController,
+            _NullMainWindow,
+            "main window",
+            get_state_text=lambda: format_state_line(self.state.state),
+            get_permission_statuses=self._get_permission_statuses,
+            get_stats_text=lambda: f"{self.stats.summary_line()}  |  {self.memory.count()} facts learned",
+            get_dictation_button_text=lambda: (
+                "Stop Dictation" if self.state.state == AppState.RECORDING else "Start Dictation"
+            ),
+            get_meeting_button_text=lambda: (
+                "Stop Meeting Notes" if self.state.state == AppState.MEETING else "Start Meeting Notes"
+            ),
+            on_toggle_dictation=lambda: self._on_toggle_clicked(None),
+            on_toggle_meeting=lambda: self._on_toggle_meeting_notes(None),
+            on_test_microphone=lambda: self._on_test_microphone(None),
+            on_open_settings_pane=permissions.open_settings_pane,
+            on_save_groq_key=self._on_window_save_groq_key,
+        )
+
         self.state.add_listener(self._on_state_change)
 
         self.hotkey_listener: GlobalHotkeyListener | None = None
@@ -222,6 +266,11 @@ class VoiceFlowApp(rumps.App):
         self._refresh_history_menu()
         self._refresh_stats_item()
 
+        self._window_refresh_timer = rumps.Timer(lambda _t: self.main_window.refresh(), 2.0)
+        self._window_refresh_timer.start()
+
+        self.main_window.show()
+        self._check_microphone_permission_async()
         self._schedule_first_run_check()
 
     def _build_optional(self, cls, fallback_cls, feature_name: str, **kwargs):
@@ -274,6 +323,7 @@ class VoiceFlowApp(rumps.App):
         self.sound_feedback_item.state = self.config.get("ui.sound_feedback", True)
 
         self.menu = [
+            rumps.MenuItem("Open VoiceFlow Window...", callback=lambda _s: self.main_window.show()),
             self.status_item,
             None,
             self.toggle_item,
@@ -474,6 +524,8 @@ class VoiceFlowApp(rumps.App):
                 self.hud.show(_HUD_TEXT[new_state])
             elif new_state in (AppState.IDLE, AppState.ERROR):
                 self.hud.hide()
+
+        self.main_window.refresh()
 
     def _on_pipeline_result(self, result: PipelineResult) -> None:
         if result.kind == "learned":
@@ -848,6 +900,12 @@ class VoiceFlowApp(rumps.App):
                 self._notify("Microphone Test Failed", str(exc), NotifyLevel.ERROR)
                 return
 
+            # The stream opened and produced samples at all - regardless of
+            # level, that means CoreAudio actually granted access, so this
+            # is real, positive evidence the permission is in place.
+            self._mic_permission_status = True
+            self.main_window.refresh()
+
             if result.peak_amplitude < MIN_USEFUL_PEAK_AMPLITUDE:
                 self._notify(
                     "Microphone Test",
@@ -866,6 +924,63 @@ class VoiceFlowApp(rumps.App):
                 )
 
         threading.Thread(target=_run, daemon=True, name="voiceflow-mic-test").start()
+
+    def _check_microphone_permission_async(self) -> None:
+        """Proactively opens (and immediately closes) the microphone shortly
+        after launch, rather than waiting for the user's first real
+        dictation attempt - this gives macOS's permission prompt the
+        earliest possible chance to fire, and means the main window's
+        Microphone status line reflects reality from the moment it's
+        first shown instead of sitting on "Not checked yet" until the
+        user happens to try something that needs it."""
+
+        def _run():
+            probe = AudioRecorder(
+                sample_rate=self.config.get("audio.sample_rate", 16000),
+                channels=self.config.get("audio.channels", 1),
+                device=self.config.get("audio.device", None),
+                max_recording_seconds=2,
+            )
+            try:
+                probe.start()
+                time.sleep(0.2)
+                probe.stop()
+                self._mic_permission_status = True
+            except Exception:
+                logger.info(
+                    "Startup microphone preflight could not open the microphone "
+                    "(permission not granted yet, or no input device available)",
+                    exc_info=True,
+                )
+                self._mic_permission_status = False
+            self.main_window.refresh()
+
+        threading.Thread(target=_run, daemon=True, name="voiceflow-mic-preflight").start()
+
+    def _get_permission_statuses(self) -> dict:
+        accessibility = (
+            check_accessibility_permission() if check_accessibility_permission is not None else None
+        )
+        return {
+            "microphone": format_permission_row("Microphone", self._mic_permission_status),
+            "accessibility": format_permission_row("Accessibility", accessibility),
+        }
+
+    def _on_window_save_groq_key(self, key: str) -> None:
+        key = key.strip()
+        if not key:
+            self.main_window.set_key_status_text("Enter a key before saving.")
+            return
+        self.config.set("providers.groq_api_key", key)
+        self.main_window.set_key_status_text("Saved - verifying...")
+
+        def _validate():
+            ok, message = validate_api_key("groq", key)
+            self.main_window.set_key_status_text(message)
+            if ok and self.config.get("ui.sound_feedback", True):
+                sounds.play_learned()
+
+        threading.Thread(target=_validate, daemon=True, name="voiceflow-window-key-validate").start()
 
     def _on_toggle_sound_feedback(self, sender) -> None:
         new_value = not self.config.get("ui.sound_feedback", True)
@@ -922,6 +1037,10 @@ class VoiceFlowApp(rumps.App):
                 self.hotkey_listener.stop()
         except Exception:
             logger.exception("Error stopping hotkey listener on quit")
+        try:
+            self._window_refresh_timer.stop()
+        except Exception:
+            logger.exception("Error stopping window refresh timer on quit")
         try:
             if self._meeting_timer is not None:
                 self._meeting_timer.stop()

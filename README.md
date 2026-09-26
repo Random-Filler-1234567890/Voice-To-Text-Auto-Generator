@@ -15,7 +15,7 @@ not on a Mac. Every platform-independent module - configuration, the
 hotkey timing state machine, the personal-memory relevance ranking, prompt
 construction, the AI provider fallback chains, the clipboard-injection
 logic, meeting-notes chunking, and the full pipeline orchestration - has a
-real, passing `pytest` suite (187 tests) that ran in that sandbox and is
+real, passing `pytest` suite (204 tests) that ran in that sandbox and is
 included in `tests/`. Run it yourself any time with `pytest`.
 
 What could **not** be built or tested here: the actual macOS `.app` bundle,
@@ -31,6 +31,33 @@ do - especially the new floating listening indicator, which is flagged
 below as the single riskiest piece of UI code in the app.
 
 ## Changelog
+
+**Round 5 (a real window, and the microphone-permission mystery):**
+
+- **Added a real window.** Menu -> "Open VoiceFlow Window..." (it also
+  opens automatically on launch now) gives you a persistent, native window
+  showing live status, Microphone/Accessibility permission state, one-click
+  buttons for the actions you'd otherwise dig through the menu for, and a
+  proper text field for your Groq key - instead of transient notifications
+  you might miss. Every control in it duplicates something already in the
+  status-bar menu, which stays fully intact as a fallback: if this window
+  ever fails to open for any reason, nothing else about the app is
+  affected. **Honest flag:** this is a bigger, more custom piece of
+  hand-written AppKit code than anything else in the app (a full window
+  with buttons and text fields, versus the HUD's single floating panel),
+  written as conservatively as I could manage - plain frame layout, no
+  Auto Layout, no custom drawing - but it is the least-proven code here.
+  If it misbehaves, the menu still does everything it always did.
+- **Added a startup microphone pre-flight check.** VoiceFlow now attempts
+  to briefly open the microphone right after launching, instead of only
+  the first time you try to dictate - this gives macOS's permission
+  prompt the earliest possible chance to appear, and the window's
+  Microphone row reflects the real result immediately rather than sitting
+  on "not checked yet."
+- **On "it never asked for microphone access" specifically:** this is very
+  likely a stuck macOS permission decision from an earlier build, not
+  something a code change can fix by itself - see **If the mic still
+  won't prompt** below for the exact command to reset it.
 
 **Round 4 (found the menu, but mic/Meeting Notes/API key were still flaky):**
 
@@ -181,37 +208,59 @@ failure mode, whatever its exact cause turns out to be:
 - **Recent Dictations + usage stats.** Recall and recopy any of your last
   8 dictations from the menu; see a running count of words dictated and
   estimated time saved.
-- **Native menu bar app.** Status icon shows what it's doing (idle /
-  recording / transcribing / formatting / pasting / learning / editing /
-  in a meeting). Everything - API keys, hotkey, mode, audio device,
-  memory, history, logs - is reachable from the menu. No config files to
-  hand-edit (though you can, they're plain JSON).
+- **Native menu bar app + a real window.** Status icon shows what it's
+  doing (idle / recording / transcribing / formatting / pasting /
+  learning / editing / in a meeting). A persistent window (opens
+  automatically, or via "Open VoiceFlow Window..." in the menu) shows live
+  permission status and gives one-click access to the most-used actions;
+  everything else - hotkey, memory, audio device, history, logs - is
+  reachable from the menu. No config files to hand-edit (though you can,
+  they're plain JSON).
 
 ## Where to find VoiceFlow
 
-**There is no Dock icon and no window.** VoiceFlow lives entirely as one
-small icon in the macOS **status bar - the strip at the top-RIGHT of your
-screen**, in the same row as your WiFi, battery, and clock icons. Right
-after opening it, look for a small microphone emoji (🎙) out there and
-click it - that opens the entire menu (Start Dictation, AI Providers,
-Memory, everything).
+**There is still no Dock icon** - VoiceFlow is a menu-bar-only app, not a
+regular foreground one (see the Round 3 changelog entry for why that
+matters). But there is now a real window: it should **open automatically**
+the first time VoiceFlow launches. If you don't see it (or you closed it),
+look for a small microphone icon (🎙) in the macOS **status bar - the
+strip at the top-RIGHT of your screen**, in the same row as your WiFi,
+battery, and clock icons - and click **"Open VoiceFlow Window..."** at the
+top of its menu. That same menu (Start Dictation, AI Providers, Memory,
+everything) is still there too and still fully functional - the window is
+additive, not a replacement.
 
-It will **not** appear as "VoiceFlow" in bold next to the Apple logo at
-the top-left of your screen the way Finder or Safari would when they're
-active - that's the normal spot for a regular foreground app, and
-VoiceFlow is deliberately not one of those (that's what a menu-bar-only
-utility is supposed to do; it's how Bartender, and almost certainly Wispr
-Flow itself, work too). If you don't see the icon, check the little `⌃` /
-`>>` overflow chevron near the clock - macOS hides menu-bar icons there
-when the bar gets crowded.
+If you don't see the icon at all, check the little `⌃`/`>>` overflow
+chevron near the clock - macOS hides menu-bar icons there when the bar
+gets crowded.
 
-Once you've found it, the fastest way to confirm the rest of the app is
-actually working is **Audio -> Test Microphone...** - it's a completely
-self-contained 1.5-second recording test that doesn't need an API key or
-the hotkey to work first, and it tells you either the exact audio level it
-heard or the exact error if it couldn't open the microphone at all
-(including if that's the very first time macOS's permission prompt shows
-up). Start there before troubleshooting anything else.
+The window's Permissions section shows live Microphone/Accessibility
+status and has a one-click "Test Mic" button - that's the fastest way to
+confirm the rest of the app is actually working, and it doesn't need an
+API key or the hotkey to work first.
+
+### If the mic still won't prompt for permission
+
+If VoiceFlow has never once shown you the "VoiceFlow would like to access
+the microphone" system dialog - not during setup, not during Test Mic, not
+ever - the most likely explanation is that an **earlier build already
+recorded a decision** for it (macOS remembers permission grants/denials
+per app identity, and that record isn't cleared by deleting the app or
+even by wiping `~/Library/Application Support/VoiceFlow`). Reset it
+explicitly:
+
+```bash
+tccutil reset Microphone com.voiceflow.app
+tccutil reset Accessibility com.voiceflow.app
+tccutil reset ListenEvent com.voiceflow.app   # Input Monitoring
+```
+
+Then quit and reopen VoiceFlow - macOS should prompt fresh. You can also
+check current state directly in **System Settings -> Privacy & Security ->
+Microphone** (and Accessibility, and Input Monitoring) - if VoiceFlow is
+listed there but unchecked, just check it; if it's not listed at all, the
+app has never successfully asked, which the `tccutil reset` + relaunch
+above should fix.
 
 ## Quick start (macOS)
 
@@ -448,11 +497,15 @@ voiceflow/
 
   ui/
     hud.py                   Floating listening indicator (AppKit) - see Honest limitations below
+    main_window.py            The persistent status/settings window (AppKit) - the largest, least-proven
+                             piece of hand-written UI code in the app; see Honest limitations below
+    status_text.py            Pure-logic text formatting for the window/menu (fully unit tested)
     onboarding.py, permissions.py, sounds.py, launch_agent.py
                              Setup copy, System Settings deep links, sound feedback, launch-at-login
 
-tests/                    187 pytest tests covering every module above except the macOS-only adapters
-                          (hud.py, listener.py, macos_context.py, injector.py's real backends, app.py)
+tests/                    204 pytest tests covering every module above except the macOS-only adapters
+                          (hud.py, main_window.py's AppKit calls, listener.py, macos_context.py,
+                          injector.py's real backends, app.py)
 ```
 
 ## Running the test suite
@@ -480,19 +533,22 @@ To set expectations correctly rather than over-promise:
   passive inference from every dictation - that keeps behavior
   predictable and avoids the model quietly "correcting" things you didn't
   ask it to.
-- The settings UI is native macOS menu items and dialogs (`rumps`), not a
-  custom-drawn preferences window - this was a deliberate reliability
-  choice: it's built entirely on rumps' well-documented, stable API
-  surface, versus hand-rolled AppKit `NSWindow` code that couldn't be
-  tested here at all before reaching you.
-- **The floating listening indicator (`ui/hud.py`) is the one exception to
-  that rule** - it's real, hand-written AppKit window code (borderless
-  floating panel, custom layer/corner-radius, main-thread marshaling via
-  `PyObjCTools.AppHelper`), which is the kind of code most likely to behave
-  differently on a real display than expected. It's defensively written
-  (any failure disables it permanently rather than crashing the app) and
-  fully toggleable from the menu ("Show Listening Indicator") if it's ever
-  glitchy - dictation itself does not depend on it working.
+- **`ui/main_window.py` and `ui/hud.py` are real, hand-written AppKit
+  code** - a titled window with buttons/text fields, and a borderless
+  floating panel, respectively - and both are the kind of code most likely
+  to behave differently on a real display than expected, since neither
+  could be executed here before reaching you. The original plan was to
+  avoid this category of code entirely and lean on rumps' well-documented
+  menu/dialog primitives instead; the window exists anyway because
+  notifications-only turned out to be genuinely confusing in practice, and
+  a persistent window was worth the added risk once that was clear. Both
+  are written as conservatively as I can manage (plain frame layout, no
+  Auto Layout, no custom drawing beyond the HUD's simple rounded
+  background) and both are defensive (a failure disables that one piece
+  rather than crashing the app) and additive (the status-bar menu still
+  does everything either of them do, and keeps working even if one of
+  them doesn't). If either misbehaves, that's real signal worth reporting
+  back, not a sign the rest of the app is broken too.
 - Meeting Notes records in sequential chunks, not continuously overlapping
   ones - see the known limitation noted in **Meeting Notes** above.
 - Distribution is unsigned (no Apple Developer Program membership was
