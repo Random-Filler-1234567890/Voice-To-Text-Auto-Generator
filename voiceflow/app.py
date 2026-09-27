@@ -8,11 +8,13 @@ This module is macOS-only (it imports ``rumps``). Run it with
 from __future__ import annotations
 
 import logging
+import shlex
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
+from pathlib import Path
 
 try:
     import rumps
@@ -45,7 +47,7 @@ from voiceflow.context.macos_context import ActiveAppDetector
 from voiceflow.hotkeys.listener import DEFAULT_KEY, SUPPORTED_KEYS, GlobalHotkeyListener
 from voiceflow.hotkeys.state_machine import HotkeyEvent, HotkeyMode
 from voiceflow.memory.store import MemoryStore
-from voiceflow.paths import LOG_PATH, MEETING_NOTES_DIR, MEMORY_PATH
+from voiceflow.paths import APP_SUPPORT_DIR, LOG_PATH, MEETING_NOTES_DIR, MEMORY_PATH, find_source_dir
 from voiceflow.pipeline import MIN_USEFUL_PEAK_AMPLITUDE, DictationPipeline, NotifyLevel, PipelineResult
 from voiceflow.state import AppState, StateManager
 from voiceflow.ui import launch_agent, onboarding, permissions, sounds
@@ -256,6 +258,7 @@ class VoiceFlowApp(rumps.App):
             on_test_microphone=lambda: self._on_test_microphone(None),
             on_open_settings_pane=permissions.open_settings_pane,
             on_save_groq_key=self._on_window_save_groq_key,
+            on_update_app=self._on_update_app,
         )
 
         self.state.add_listener(self._on_state_change)
@@ -338,6 +341,7 @@ class VoiceFlowApp(rumps.App):
             rumps.MenuItem("Permissions & Setup Guide...", callback=self._on_show_setup_guide),
             rumps.MenuItem("How VoiceFlow Works...", callback=self._on_show_hotkey_help),
             rumps.MenuItem("View Logs", callback=self._on_view_logs),
+            rumps.MenuItem("Update VoiceFlow...", callback=lambda _s: self._on_update_app()),
             None,
             self.stats_item,
             None,
@@ -1022,6 +1026,32 @@ class VoiceFlowApp(rumps.App):
 
     def _on_view_logs(self, _sender) -> None:
         subprocess.run(["open", str(LOG_PATH)], check=False)
+
+    def _on_update_app(self) -> None:
+        source_dir = find_source_dir(APP_SUPPORT_DIR, Path.home())
+        if source_dir is None:
+            rumps.alert(
+                title="Can't Find VoiceFlow's Source Folder",
+                message="VoiceFlow couldn't figure out where it was built from, so it "
+                "can't run the updater automatically. Open Terminal yourself and run:\n\n"
+                "cd ~/VoiceFlow && ./update_macos_app.sh\n\n"
+                "(substituting wherever you actually cloned it, if not ~/VoiceFlow)",
+                ok="OK",
+            )
+            return
+
+        script = f"cd {shlex.quote(str(source_dir))} && ./update_macos_app.sh"
+        safe_script = script.replace("\\", "\\\\").replace('"', '\\"')
+        apple_script = f'tell application "Terminal"\nactivate\ndo script "{safe_script}"\nend tell'
+        try:
+            subprocess.run(["osascript", "-e", apple_script], check=False)
+        except Exception:
+            logger.exception("Failed to launch the updater in Terminal")
+            self._notify(
+                "VoiceFlow",
+                f"Couldn't open Terminal automatically. Run this yourself: {script}",
+                NotifyLevel.ERROR,
+            )
 
     def _on_about(self, _sender) -> None:
         rumps.alert(

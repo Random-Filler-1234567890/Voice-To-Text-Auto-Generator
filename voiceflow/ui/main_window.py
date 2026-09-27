@@ -50,7 +50,7 @@ except ImportError:  # pragma: no cover - exercised only off-macOS
     _APPKIT_AVAILABLE = False
 
 _WINDOW_WIDTH = 380
-_WINDOW_HEIGHT = 480
+_WINDOW_HEIGHT = 542
 _MARGIN = 20
 _ROW_HEIGHT = 26
 _ROW_GAP = 10
@@ -105,6 +105,7 @@ class MainWindowController:
         on_test_microphone: Callable[[], None],
         on_open_settings_pane: Callable[[str], None],
         on_save_groq_key: Callable[[str], None],
+        on_update_app: Callable[[], None],
     ) -> None:
         self._enabled = _APPKIT_AVAILABLE
         self._get_state_text = get_state_text
@@ -117,6 +118,7 @@ class MainWindowController:
         self._on_test_microphone = on_test_microphone
         self._on_open_settings_pane = on_open_settings_pane
         self._on_save_groq_key = on_save_groq_key
+        self._on_update_app = on_update_app
 
         self._window = None
         self._targets: list = []  # keeps _ActionTarget instances alive
@@ -242,6 +244,17 @@ class MainWindowController:
 
         y = self._add_section_label(content, "Usage", y)
         self._labels["stats"] = self._add_label(content, "...", y, x=_MARGIN, width=_WINDOW_WIDTH - 2 * _MARGIN)
+        y -= _ROW_HEIGHT + _ROW_GAP
+
+        y = self._add_section_label(content, "Maintenance", y)
+        self._add_button(
+            content,
+            "Update VoiceFlow...",
+            y,
+            self._on_update_app,
+            x=_MARGIN,
+            width=_WINDOW_WIDTH - 2 * _MARGIN,
+        )
         y -= _ROW_HEIGHT + _ROW_GAP
 
         self._add_label(

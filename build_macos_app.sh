@@ -57,6 +57,31 @@ print('    -> OK: voiceflow.app imports without error')
     exit 1
 fi
 
+echo "==> Verifying the audio backend (sounddevice/PortAudio) actually loads..."
+if ! python3 -c "
+import sounddevice
+devices = sounddevice.query_devices()
+print(f'    -> OK: sounddevice loaded, {len(devices)} audio device(s) visible')
+"; then
+    ARCH="$(uname -m)"
+    echo ""
+    echo "================================================================"
+    echo " sounddevice/PortAudio failed to load (see the error above)."
+    echo " Your Mac's processor type: $ARCH"
+    echo ""
+    echo " This is almost always a CPU-architecture mismatch - pip installed"
+    echo " a build of sounddevice that doesn't match your Mac (Apple Silicon"
+    echo " 'arm64' vs Intel 'x86_64'), often because of a Rosetta-emulated"
+    echo " Python. Try:"
+    echo "   pip uninstall -y sounddevice"
+    echo "   pip install --force-reinstall --no-cache-dir sounddevice"
+    echo " then re-run this script. If that doesn't help, run 'file \$(which"
+    echo " python3)' and compare its architecture to \"$ARCH\" above - a"
+    echo " mismatch there means you need a native (non-Rosetta) Python 3."
+    echo "================================================================"
+    exit 1
+fi
+
 echo "==> Building the app icon..."
 if [[ -f assets/icon_1024.png ]]; then
     ICONSET_DIR="assets/icon.iconset"
@@ -98,6 +123,15 @@ if pgrep -x "VoiceFlow" >/dev/null 2>&1; then
     echo "    -> VoiceFlow launched and is still running after 4 seconds. Good sign!"
 else
     SMOKE_TEST_OK=0
+fi
+
+if [[ "$SMOKE_TEST_OK" == "1" ]]; then
+    # Remember where this source checkout lives, so the app's own
+    # "Update VoiceFlow..." button knows where to run the update script
+    # from later, regardless of what folder name you used.
+    SUPPORT_DIR="$HOME/Library/Application Support/VoiceFlow"
+    mkdir -p "$SUPPORT_DIR"
+    pwd > "$SUPPORT_DIR/source_dir.txt"
 fi
 
 echo ""

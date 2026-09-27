@@ -2,8 +2,9 @@ import wave
 import io
 
 import numpy as np
+import pytest
 
-from voiceflow.audio.recorder import AudioRecorder
+from voiceflow.audio.recorder import AudioRecorder, MicrophoneUnavailableError
 
 
 def test_encode_wav_produces_valid_playable_wav():
@@ -48,3 +49,33 @@ def test_list_input_devices_returns_empty_list_without_sounddevice(monkeypatch):
     monkeypatch.setattr(recorder_module, "sd", None)
     recorder = AudioRecorder()
     assert recorder.list_input_devices() == []
+
+
+def test_start_without_sounddevice_surfaces_the_real_import_error(monkeypatch):
+    # Regression test: a report of "sounddevice is not available on this
+    # device/installation" with no further detail turned out to be
+    # untraceable precisely because the real underlying ImportError/OSError
+    # was being silently discarded. The raised error must now include it.
+    import voiceflow.audio.recorder as recorder_module
+
+    monkeypatch.setattr(recorder_module, "sd", None)
+    monkeypatch.setattr(
+        recorder_module, "_IMPORT_ERROR", "OSError: dlopen failed, wrong architecture"
+    )
+    recorder = AudioRecorder()
+    with pytest.raises(MicrophoneUnavailableError) as exc_info:
+        recorder.start()
+    assert "wrong architecture" in str(exc_info.value)
+
+
+def test_start_without_sounddevice_and_no_captured_error_still_gives_actionable_message(
+    monkeypatch,
+):
+    import voiceflow.audio.recorder as recorder_module
+
+    monkeypatch.setattr(recorder_module, "sd", None)
+    monkeypatch.setattr(recorder_module, "_IMPORT_ERROR", None)
+    recorder = AudioRecorder()
+    with pytest.raises(MicrophoneUnavailableError) as exc_info:
+        recorder.start()
+    assert "rebuild" in str(exc_info.value).lower()

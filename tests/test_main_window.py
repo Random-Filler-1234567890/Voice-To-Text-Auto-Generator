@@ -21,6 +21,7 @@ def _make_controller(**overrides):
         on_test_microphone=lambda: None,
         on_open_settings_pane=lambda name: None,
         on_save_groq_key=lambda key: None,
+        on_update_app=lambda: None,
     )
     defaults.update(overrides)
     return MainWindowController(**defaults)

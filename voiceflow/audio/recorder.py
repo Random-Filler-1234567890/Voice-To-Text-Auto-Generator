@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import io
 import logging
+import platform
+import sys
 import threading
 import time
 import wave
@@ -22,12 +24,27 @@ from typing import Optional
 
 import numpy as np
 
+logger = logging.getLogger("voiceflow.audio")
+
+# The underlying reason sounddevice failed to import, if it did - swallowing
+# this into a generic "not available" message is exactly how a real,
+# diagnosable problem (wrong CPU architecture wheel, missing PortAudio
+# binary in the packaged app, etc.) turns into an unhelpful dead end. We
+# keep the original exception text so it can be surfaced to the user
+# instead of just logged and discarded.
+_IMPORT_ERROR: Optional[str] = None
+
 try:
     import sounddevice as sd
-except (ImportError, OSError):  # pragma: no cover - exercised only off-macOS
+except (ImportError, OSError) as exc:  # pragma: no cover - exercised only off-macOS
     sd = None
-
-logger = logging.getLogger("voiceflow.audio")
+    _IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+    logger.error(
+        "sounddevice failed to import (machine=%s, python=%s): %s",
+        platform.machine(),
+        sys.version.split()[0],
+        _IMPORT_ERROR,
+    )
 
 
 class MicrophoneUnavailableError(RuntimeError):
@@ -94,8 +111,14 @@ class AudioRecorder:
 
     def start(self, on_max_duration_exceeded=None) -> None:
         if sd is None:
+            detail = f" ({_IMPORT_ERROR})" if _IMPORT_ERROR else ""
             raise MicrophoneUnavailableError(
-                "sounddevice is not available on this platform/installation."
+                f"The audio library (sounddevice/PortAudio) failed to load{detail}. This "
+                f"usually means the wrong CPU-architecture build got installed (Apple "
+                f"Silicon vs Intel) or the audio backend didn't get bundled correctly. "
+                f"Try: quit VoiceFlow, run `pip uninstall -y sounddevice && pip install "
+                f"--force-reinstall --no-cache-dir sounddevice` inside the project's "
+                f".venv, then rebuild with ./build_macos_app.sh."
             )
         if self._recording:
             logger.warning("start() called while already recording; ignoring")

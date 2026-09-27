@@ -15,7 +15,7 @@ not on a Mac. Every platform-independent module - configuration, the
 hotkey timing state machine, the personal-memory relevance ranking, prompt
 construction, the AI provider fallback chains, the clipboard-injection
 logic, meeting-notes chunking, and the full pipeline orchestration - has a
-real, passing `pytest` suite (204 tests) that ran in that sandbox and is
+real, passing `pytest` suite (211 tests) that ran in that sandbox and is
 included in `tests/`. Run it yourself any time with `pytest`.
 
 What could **not** be built or tested here: the actual macOS `.app` bundle,
@@ -31,6 +31,34 @@ do - especially the new floating listening indicator, which is flagged
 below as the single riskiest piece of UI code in the app.
 
 ## Changelog
+
+**Round 6 (the actual "sounddevice not available" error, one-command reinstall, in-app updates):**
+
+- **Fixed a real bug: the exact reason sounddevice failed to load was being
+  silently discarded.** "Microphone Test Failed: sounddevice is not
+  available on this device/installation" was the *entire* message -
+  there was no way to tell whether that meant a missing library, a wrong
+  CPU-architecture wheel, or something else, because the original
+  `ImportError`/`OSError` was caught and thrown away rather than kept.
+  Fixed so the real underlying error is now included, and the build
+  script (see next point) catches this specific failure with a targeted
+  fix suggestion instead of it only surfacing later, mid-use.
+- **`build_macos_app.sh` now explicitly verifies the audio backend loads**
+  (`import sounddevice; sounddevice.query_devices()`), not just that
+  VoiceFlow's own code imports - the two are different: your code can
+  import fine while the *native* PortAudio library it depends on fails to
+  load, which is exactly what "sounddevice not available" means. If this
+  check fails, the script now prints your Mac's processor architecture
+  and the specific `pip uninstall`/`pip install --force-reinstall` command
+  to try - a CPU-architecture mismatch (Apple Silicon vs. Intel wheels,
+  often via a Rosetta-emulated Python) is the most common cause.
+- **Added a one-command full uninstall + reinstall** - see below.
+- **Added an "Update VoiceFlow..." button** (in both the window and the
+  menu) that opens a visible Terminal window and runs the updater for you
+  - no more manually opening Terminal and remembering the path. It finds
+  your source checkout automatically (`build_macos_app.sh` now records
+  where it was run from) and falls back to `~/VoiceFlow` if that record
+  isn't there yet.
 
 **Round 5 (a real window, and the microphone-permission mystery):**
 
@@ -357,14 +385,48 @@ cd VoiceFlow   # wherever you cloned it
 ```
 
 This pulls the latest code, quits the running app, rebuilds and
-self-tests it (same checks as `build_macos_app.sh` - import check + a real
-launch-and-stay-running check), replaces `/Applications/VoiceFlow.app`,
-and reopens it. It only prints "Done!" if that self-test actually passed -
-if anything's broken it stops and tells you what, instead of claiming
-success over a build that doesn't work. Your config, memory, history, and
-stats all live outside the `.app` bundle (in
-`~/Library/Application Support/VoiceFlow/`), so updating never touches or
-resets any of that.
+self-tests it (same checks as `build_macos_app.sh` - import check + audio
+backend check + a real launch-and-stay-running check), replaces
+`/Applications/VoiceFlow.app`, and reopens it. It only prints "Done!" if
+that self-test actually passed - if anything's broken it stops and tells
+you what, instead of claiming success over a build that doesn't work.
+Your config, memory, history, and stats all live outside the `.app`
+bundle (in `~/Library/Application Support/VoiceFlow/`), so updating never
+touches or resets any of that.
+
+**Even more convenient:** click the mic icon in the menu bar (or open the
+main window) -> **"Update VoiceFlow..."**. It runs the exact same script
+for you in a visible Terminal window, so you never have to type the `cd`/
+`./update_macos_app.sh` yourself. It finds your source checkout
+automatically as long as you've built at least once since this button was
+added; if it can't find it, it tells you the manual command to run instead
+of guessing wrong.
+
+### Full uninstall + reinstall
+
+If something's stuck and you want a completely clean slate, this single
+block does the whole thing - kills the running app, removes the installed
+app, all of VoiceFlow's saved data, the login-item helper, and any old
+source checkout, then clones fresh and rebuilds:
+
+```bash
+killall VoiceFlow 2>/dev/null; \
+rm -rf /Applications/VoiceFlow.app \
+       ~/Library/Application\ Support/VoiceFlow \
+       ~/Library/LaunchAgents/com.voiceflow.app.plist \
+       ~/VoiceFlow && \
+cd ~ && \
+git clone https://github.com/random-filler-1234567890/voice-to-text-auto-generator.git VoiceFlow && \
+cd VoiceFlow && \
+./build_macos_app.sh && \
+cp -R dist/VoiceFlow.app /Applications/ && \
+killall VoiceFlow 2>/dev/null; \
+open /Applications/VoiceFlow.app
+```
+
+This is safe to run even if nothing was installed yet (each removal is a
+no-op on files that don't exist) - it's the same "one command" whether
+you're updating, starting over, or setting up for the very first time.
 
 ## How the hotkey works
 
@@ -503,7 +565,7 @@ voiceflow/
     onboarding.py, permissions.py, sounds.py, launch_agent.py
                              Setup copy, System Settings deep links, sound feedback, launch-at-login
 
-tests/                    204 pytest tests covering every module above except the macOS-only adapters
+tests/                    211 pytest tests covering every module above except the macOS-only adapters
                           (hud.py, main_window.py's AppKit calls, listener.py, macos_context.py,
                           injector.py's real backends, app.py)
 ```

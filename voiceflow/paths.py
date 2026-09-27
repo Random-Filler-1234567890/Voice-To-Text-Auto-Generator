@@ -68,3 +68,38 @@ def ensure_directories() -> None:
 
 def ensure_meeting_notes_dir() -> None:
     MEETING_NOTES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+SOURCE_DIR_SENTINEL_NAME = "source_dir.txt"
+
+
+def find_source_dir(app_support_dir: Path, home_dir: Path) -> Path | None:
+    """Locate the git checkout ``update_macos_app.sh`` lives in.
+
+    The running .app bundle has no inherent link back to wherever its
+    source was cloned from - build_macos_app.sh writes that location down
+    (in ``<app_support_dir>/source_dir.txt``) the moment it produces a
+    working build, specifically so this doesn't have to guess. Falls back
+    to the conventional ``~/VoiceFlow`` this project's docs have
+    consistently pointed people to, for a build made before that file
+    started being written.
+
+    Pure path logic - no filesystem writes, so it's safe to call from
+    anywhere and easy to unit test with a tmp_path standing in for both
+    directories.
+    """
+    candidates: list[Path] = []
+    sentinel = app_support_dir / SOURCE_DIR_SENTINEL_NAME
+    if sentinel.exists():
+        try:
+            recorded = sentinel.read_text().strip()
+        except OSError:
+            recorded = ""
+        if recorded:
+            candidates.append(Path(recorded))
+    candidates.append(home_dir / "VoiceFlow")
+
+    for candidate in candidates:
+        if (candidate / "update_macos_app.sh").is_file():
+            return candidate
+    return None
