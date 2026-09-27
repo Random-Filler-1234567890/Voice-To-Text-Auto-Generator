@@ -41,6 +41,16 @@ OPTIONS = {
         "rumps",
         "pynput",
         "sounddevice",
+        # sounddevice's macOS wheel ships the actual PortAudio binary in a
+        # SEPARATE top-level package, "_sounddevice_data" (not a submodule
+        # of "sounddevice"). Without listing it here too, py2app doesn't
+        # know it holds a native library and zips its contents - including
+        # portaudio-binaries/libportaudio.dylib - into python39.zip. macOS
+        # can't dlopen() a shared library from inside a zip file, so the
+        # app builds and launches "fine" but every microphone access fails
+        # with "cannot load library ... python39.zip/_sounddevice_data/...".
+        # This one line is the actual fix for that bug.
+        "_sounddevice_data",
         "numpy",
         "requests",
         "pyperclip",

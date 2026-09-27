@@ -15,7 +15,7 @@ not on a Mac. Every platform-independent module - configuration, the
 hotkey timing state machine, the personal-memory relevance ranking, prompt
 construction, the AI provider fallback chains, the clipboard-injection
 logic, meeting-notes chunking, and the full pipeline orchestration - has a
-real, passing `pytest` suite (211 tests) that ran in that sandbox and is
+real, passing `pytest` suite (213 tests) that ran in that sandbox and is
 included in `tests/`. Run it yourself any time with `pytest`.
 
 What could **not** be built or tested here: the actual macOS `.app` bundle,
@@ -31,6 +31,34 @@ do - especially the new floating listening indicator, which is flagged
 below as the single riskiest piece of UI code in the app.
 
 ## Changelog
+
+**Round 7 (the actual, actual root cause of the sounddevice/PortAudio crash):**
+
+- **Found and fixed the real bug behind "cannot load library ...
+  python39.zip/_sounddevice_data/portaudio-binaries/libportaudio.dylib".**
+  Round 6's fix (surfacing the real error instead of a generic message)
+  worked exactly as intended - it's the only reason this precise error was
+  visible at all. That error revealed the actual root cause: `sounddevice`'s
+  macOS wheel ships PortAudio's binary in a **separate top-level package**
+  called `_sounddevice_data`, not inside `sounddevice` itself. `setup.py`
+  only told py2app to bundle `sounddevice` as a real unzipped directory -
+  it had never heard of `_sounddevice_data`, so it silently zipped that
+  package (dylib included) into `python39.zip`. macOS's `dlopen()` cannot
+  load a shared library from inside a zip archive, full stop - so the app
+  built, launched, and looked fine, and only failed the instant something
+  tried to actually open the microphone. Fixed with one line: added
+  `"_sounddevice_data"` to `setup.py`'s `OPTIONS["packages"]`. Added
+  `tests/test_setup_packages.py` so this exact line can never be quietly
+  reverted or lost in a future edit.
+- **`build_macos_app.sh` now checks the *frozen* app for this whole class of
+  bug, not just the dev virtualenv.** The Round 6 self-test ran
+  `import sounddevice` inside `.venv`, which was always going to pass -
+  that's not where the bug lives. The bug only exists inside py2app's
+  frozen bundle layout. The build script now opens the built
+  `python39.zip` directly after packaging and scans it for any `.dylib`/
+  `.so` file that shouldn't be there, failing the build immediately (with
+  the exact offending path printed) instead of producing an app that looks
+  fine until you try to use the microphone.
 
 **Round 6 (the actual "sounddevice not available" error, one-command reinstall, in-app updates):**
 

@@ -113,6 +113,46 @@ if [[ ! -x "$APP_BINARY" ]]; then
     exit 1
 fi
 
+echo "==> Verifying no native libraries got trapped inside the frozen app's zip..."
+echo "    (this is the check that would have caught the 'sounddevice/PortAudio"
+echo "     failed to load' bug - the dev .venv check above can't see it, since"
+echo "     it only happens inside py2app's frozen bundle layout)"
+FROZEN_ZIP="dist/VoiceFlow.app/Contents/Resources/lib/python39.zip"
+if [[ -f "$FROZEN_ZIP" ]]; then
+    if ! python3 -c "
+import zipfile
+import sys
+
+with zipfile.ZipFile('$FROZEN_ZIP') as z:
+    trapped = [n for n in z.namelist() if n.endswith(('.dylib', '.so'))]
+    if trapped:
+        print('    -> FOUND native binaries trapped inside the compressed zip:')
+        for name in trapped:
+            print(f'         {name}')
+        sys.exit(1)
+    print('    -> OK: no .dylib/.so files found inside python39.zip')
+"; then
+        echo ""
+        echo "================================================================"
+        echo " BUILD BUG: a native (.dylib/.so) library ended up bundled"
+        echo " inside the compressed python39.zip archive. macOS cannot"
+        echo " dlopen() a shared library from inside a zip file, so anything"
+        echo " relying on it (like the sounddevice/PortAudio audio backend)"
+        echo " will fail at runtime with an OSError - even though this build"
+        echo " otherwise 'succeeds' and the app launches."
+        echo ""
+        echo " Fix: whichever package owns the file(s) named above needs to"
+        echo " be added to setup.py's OPTIONS[\"packages\"] list, so py2app"
+        echo " copies it as a real unzipped directory instead of zipping it."
+        echo " (This is exactly what _sounddevice_data needed for sounddevice"
+        echo " itself - check if a similar sibling data-package is missing.)"
+        echo "================================================================"
+        exit 1
+    fi
+else
+    echo "    (python39.zip not found at the expected path - skipping this check)"
+fi
+
 echo "==> Smoke-testing the built app (launches it for a few seconds)..."
 killall VoiceFlow >/dev/null 2>&1 || true
 sleep 1
